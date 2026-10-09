@@ -375,9 +375,10 @@ function mat4Mul(a, b) {
   }
   return o;
 }
-function perspective(fovy, aspect, n, f) {
+// shiftY: off-axis lens shift, moves the whole image up by shiftY in NDC (no change to perspective).
+function perspective(fovy, aspect, n, f, shiftY = 0) {
   const t = 1 / Math.tan(fovy / 2), nf = 1 / (n - f);
-  return new Float32Array([t / aspect, 0, 0, 0, 0, t, 0, 0, 0, 0, (f + n) * nf, -1, 0, 0, 2 * f * n * nf, 0]);
+  return new Float32Array([t / aspect, 0, 0, 0, 0, t, 0, 0, 0, -shiftY, (f + n) * nf, -1, 0, 0, 2 * f * n * nf, 0]);
 }
 function ortho(l, r, b, t, n, f) {
   return new Float32Array([2 / (r - l), 0, 0, 0, 0, 2 / (t - b), 0, 0, 0, 0, -2 / (f - n), 0,
@@ -417,6 +418,7 @@ const SLAB_X = 5.2, SLAB_Z = 7.6, SLAB_H = 0.4;
 const STORE_Z = 6.25;                              // unused fence rows
 const ANIM_MS = 360;                               // move animation (must be <= 400)
 const FOV = 45 * Math.PI / 180;
+const LENS_SHIFT = 0.22;                           // NDC; lifts the image so the near-heavy board looks centred
 const cellX = c => c - 4;
 const cellZ = r => 4 - r;                          // row A nearest to player A's camera (+z)
 
@@ -1040,7 +1042,7 @@ function draw(now) {
   resize();
   const W = canvas.width, H = canvas.height;
   const eye = camEye();
-  const vp = mat4Mul(perspective(FOV, W / H, 0.3, 120), lookAt(eye, [cam.tx, 0, cam.tz], [0, 1, 0]));
+  const vp = mat4Mul(perspective(FOV, W / H, 0.3, 120, LENS_SHIFT), lookAt(eye, [cam.tx, 0, cam.tz], [0, 1, 0]));
   lastVP = vp; lastEye = eye;
   const objs = sceneObjects();
 
@@ -1232,7 +1234,7 @@ function newGame() {
  * ===================================================================== */
 function rayFromEvent(e) {
   const rect = canvas.getBoundingClientRect();
-  const nx = ((e.clientX - rect.left) / rect.width) * 2 - 1, ny = 1 - ((e.clientY - rect.top) / rect.height) * 2;
+  const nx = ((e.clientX - rect.left) / rect.width) * 2 - 1, ny = 1 - ((e.clientY - rect.top) / rect.height) * 2 - LENS_SHIFT;
   const eye = camEye(), fwd = norm(sub([cam.tx, 0, cam.tz], eye));
   const right = norm(cross(fwd, [0, 1, 0])), up = cross(right, fwd);
   const th = Math.tan(FOV / 2), aspect = rect.width / rect.height;
