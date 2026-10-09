@@ -1,0 +1,1220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Quoridor 3D</title>
+<style>
+  :root {
+    --panel: rgba(28, 22, 18, 0.86);
+    --panel-border: rgba(255, 235, 205, 0.16);
+    --text: #f3e9da;
+    --muted: #c9b9a3;
+    --accent: #e0b062;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: #141110;
+    color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    user-select: none; -webkit-user-select: none;
+  }
+  #gl { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  #labels { position: fixed; inset: 0; pointer-events: none; overflow: hidden; }
+  .lbl {
+    position: absolute; left: 0; top: 0;
+    font-weight: 650; color: #f4e7d2;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.85);
+    white-space: nowrap; will-change: transform;
+  }
+  #toolbar {
+    position: fixed; top: 12px; right: 12px; display: flex; gap: 8px;
+  }
+  #toolbar button, .panel button {
+    font: inherit; color: var(--text); cursor: pointer;
+    background: var(--panel); border: 1px solid var(--panel-border);
+    border-radius: 10px; height: 40px; min-width: 40px; padding: 0 10px;
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    backdrop-filter: blur(6px);
+  }
+  #toolbar button:hover, .panel button:hover { border-color: rgba(255,235,205,0.4); }
+  #toolbar button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+  #toolbar svg { width: 20px; height: 20px; }
+  .panel {
+    position: fixed; top: 62px; right: 12px; width: min(360px, calc(100vw - 24px));
+    background: var(--panel); border: 1px solid var(--panel-border); border-radius: 12px;
+    padding: 14px 16px; backdrop-filter: blur(6px);
+    box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+  }
+  .panel h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); font-weight: 650; }
+  .panel .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 8px 0; }
+  .panel select { font: inherit; color: var(--text); background: #2c241e; border: 1px solid var(--panel-border); border-radius: 6px; padding: 4px 6px; }
+  .panel input[type=checkbox] { width: 18px; height: 18px; accent-color: var(--accent); }
+  .hud-player { margin: 10px 0 0; padding-top: 10px; border-top: 1px solid var(--panel-border); }
+  .hud-player b { color: var(--text); }
+  .hud-sub { color: var(--muted); }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: 0; border: 1px solid rgba(0,0,0,0.4); }
+  #banner {
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    text-align: center; padding: 22px 30px; width: auto; right: auto;
+  }
+  #banner .big { font-size: 24px; font-weight: 700; margin-bottom: 14px; }
+  #error { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; padding: 24px; text-align: center; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="labels"></div>
+
+<div id="toolbar">
+  <button id="btnViewA" title="View from Player A's side" aria-label="View from Player A's side">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>A
+  </button>
+  <button id="btnViewB" title="View from Player B's side" aria-label="View from Player B's side">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>B
+  </button>
+  <button id="btnInfo" title="Information" aria-label="Information" aria-pressed="false">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9.5"/><path d="M12 11v6"/><circle cx="12" cy="7.5" r="0.6" fill="currentColor"/></svg>
+  </button>
+  <button id="btnSettings" title="Settings" aria-label="Settings" aria-pressed="false">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M5.3 18.7l2.1-2.1M16.6 7.4l2.1-2.1"/><circle cx="12" cy="12" r="6.5"/></svg>
+  </button>
+</div>
+
+<div id="hud" class="panel" hidden></div>
+
+<div id="settings" class="panel" hidden>
+  <h2>Settings</h2>
+  <div class="row"><label for="optLabels">Show grid labels</label><input type="checkbox" id="optLabels"></div>
+  <div class="row"><label for="optColorA">Player A pawn color</label><select id="optColorA"></select></div>
+  <div class="row"><label for="optColorB">Player B pawn color</label><select id="optColorB"></select></div>
+  <div class="row"><label for="optAuto">Auto perspective</label><input type="checkbox" id="optAuto"></div>
+  <div class="row"><span class="hud-sub">Drag to orbit · Shift+drag to pan · Wheel to zoom</span></div>
+  <div class="row"><button id="btnNewGame">New game</button></div>
+</div>
+
+<div id="banner" class="panel" hidden>
+  <div class="big" id="bannerText"></div>
+  <button id="btnPlayAgain">Play again</button>
+</div>
+
+<div id="error" hidden></div>
+
+<script>
+'use strict';
+
+/* =====================================================================
+ * Game rules
+ * ---------------------------------------------------------------------
+ * Squares: row r = 0..8 (letters A..I), column c = 0..8 (numbers 1..9).
+ * Player 0 ("A") starts at A5 (r=0,c=4) and must reach row I (r=8).
+ * Player 1 ("B") starts at I5 (r=8,c=4) and must reach row A (r=0).
+ *
+ * Fences live on the 8x8 grid of groove intersections. A fence with
+ * index (i, j) is centred on the corner shared by squares (i,j), (i,j+1),
+ * (i+1,j), (i+1,j+1).
+ *   h[i*8+j] : horizontal fence, separates rows i and i+1 over columns j, j+1
+ *   v[i*8+j] : vertical fence, separates columns j and j+1 over rows i, i+1
+ * ===================================================================== */
+const LETTERS = 'ABCDEFGHI';
+const GOAL = [8, 0];
+const UNREACH = 999;
+const DR = [1, -1, 0, 0], DC = [0, 0, 1, -1];
+const PERP = [[2, 3], [2, 3], [0, 1], [0, 1]];
+
+function newState() {
+  return { pr: [0, 8], pc: [4, 4], h: new Uint8Array(64), v: new Uint8Array(64), left: [10, 10], turn: 0, winner: -1 };
+}
+function cloneState(s) {
+  return { pr: s.pr.slice(), pc: s.pc.slice(), h: new Uint8Array(s.h), v: new Uint8Array(s.v), left: s.left.slice(), turn: s.turn, winner: s.winner };
+}
+
+// Can a pawn step from (r,c) one square in direction d without leaving the
+// board or crossing a fence? Each step can be blocked by two fence slots.
+function canStep(s, r, c, d) {
+  const h = s.h, v = s.v;
+  switch (d) {
+    case 0: if (r >= 8) return false; return !((c < 8 && h[r * 8 + c]) || (c > 0 && h[r * 8 + c - 1]));
+    case 1: if (r <= 0) return false; return !((c < 8 && h[(r - 1) * 8 + c]) || (c > 0 && h[(r - 1) * 8 + c - 1]));
+    case 2: if (c >= 8) return false; return !((r < 8 && v[r * 8 + c]) || (r > 0 && v[(r - 1) * 8 + c]));
+    case 3: if (c <= 0) return false; return !((r < 8 && v[r * 8 + c - 1]) || (r > 0 && v[(r - 1) * 8 + c - 1]));
+  }
+  return false;
+}
+
+// Legal pawn destinations for player p (direct translation of PROJECT.md's pseudocode).
+function pawnMoves(s, p) {
+  const r = s.pr[p], c = s.pc[p], or = s.pr[1 - p], oc = s.pc[1 - p];
+  const out = [];
+  for (let d = 0; d < 4; d++) {
+    if (!canStep(s, r, c, d)) continue;
+    const nr = r + DR[d], nc = c + DC[d];
+    if (nr !== or || nc !== oc) { out.push([nr, nc]); continue; }
+    // Opponent occupies the square: jump straight, or sideways if blocked.
+    if (canStep(s, nr, nc, d)) out.push([nr + DR[d], nc + DC[d]]);
+    else for (const pd of PERP[d]) if (canStep(s, nr, nc, pd)) out.push([nr + DR[pd], nc + DC[pd]]);
+  }
+  return out;
+}
+
+// BFS shortest path length (ignoring pawns) from player p to its goal row.
+// Uses preallocated buffers and a generation stamp so it allocates nothing;
+// it is called many thousands of times by the hint search.
+const bfsQ = new Int16Array(81), bfsD = new Int16Array(81), bfsSeen = new Uint32Array(81);
+let bfsGen = 0;
+function dist(s, p) {
+  const goal = GOAL[p];
+  if (s.pr[p] === goal) return 0;
+  const gen = ++bfsGen;
+  let head = 0, tail = 0;
+  const start = s.pr[p] * 9 + s.pc[p];
+  bfsQ[tail++] = start; bfsSeen[start] = gen; bfsD[start] = 0;
+  while (head < tail) {
+    const cur = bfsQ[head++], r = (cur / 9) | 0, c = cur - r * 9, nd = bfsD[cur] + 1;
+    for (let d = 0; d < 4; d++) {
+      if (!canStep(s, r, c, d)) continue;
+      const nr = r + DR[d], nxt = nr * 9 + c + DC[d];
+      if (bfsSeen[nxt] === gen) continue;
+      if (nr === goal) return nd;
+      bfsSeen[nxt] = gen; bfsD[nxt] = nd; bfsQ[tail++] = nxt;
+    }
+  }
+  return UNREACH;
+}
+
+// One concrete shortest path for player p as a list of steps [r, c, dir].
+function pathSteps(s, p) {
+  const field = new Int16Array(81).fill(-1);
+  const q = [];
+  const goal = GOAL[p];
+  for (let c = 0; c < 9; c++) { field[goal * 9 + c] = 0; q.push(goal * 9 + c); }
+  for (let head = 0; head < q.length; head++) {
+    const cur = q[head], r = (cur / 9) | 0, c = cur % 9;
+    for (let d = 0; d < 4; d++) {
+      if (!canStep(s, r, c, d)) continue;
+      const nxt = (r + DR[d]) * 9 + c + DC[d];
+      if (field[nxt] >= 0) continue;
+      field[nxt] = field[cur] + 1; q.push(nxt);
+    }
+  }
+  const steps = [];
+  let r = s.pr[p], c = s.pc[p];
+  if (field[r * 9 + c] < 0) return steps;
+  while (field[r * 9 + c] > 0) {
+    const k = field[r * 9 + c];
+    for (let d = 0; d < 4; d++) {
+      if (canStep(s, r, c, d) && field[(r + DR[d]) * 9 + c + DC[d]] === k - 1) {
+        steps.push([r, c, d]); r += DR[d]; c += DC[d]; break;
+      }
+    }
+  }
+  return steps;
+}
+
+// The (up to two) fence slots that would block step (r,c)->dir, as [o,i,j].
+function blockers(r, c, d) {
+  const out = [];
+  const add = (o, i, j) => { if (i >= 0 && i < 8 && j >= 0 && j < 8) out.push([o, i, j]); };
+  if (d === 0) { add(0, r, c); add(0, r, c - 1); }
+  else if (d === 1) { add(0, r - 1, c); add(0, r - 1, c - 1); }
+  else if (d === 2) { add(1, r, c); add(1, r - 1, c); }
+  else { add(1, r, c - 1); add(1, r - 1, c - 1); }
+  return out;
+}
+
+// Does a fence fit at (o,i,j) without overlapping or crossing another? (No path check.)
+function fenceFree(s, o, i, j) {
+  if (i < 0 || i > 7 || j < 0 || j > 7) return false;
+  const k = i * 8 + j;
+  if (s.h[k] || s.v[k]) return false;            // same slot, or crossing at the centre
+  if (o === 0) return !((j > 0 && s.h[k - 1]) || (j < 7 && s.h[k + 1]));
+  return !((i > 0 && s.v[k - 8]) || (i < 7 && s.v[k + 8]));
+}
+// Full legality: fits AND both players still have a path to their goal.
+function fenceLegal(s, o, i, j) {
+  if (!fenceFree(s, o, i, j)) return false;
+  const arr = o ? s.v : s.h, k = i * 8 + j;
+  arr[k] = 1;
+  const ok = dist(s, 0) < UNREACH && dist(s, 1) < UNREACH;
+  arr[k] = 0;
+  return ok;
+}
+
+function fenceName(o, i, j) {
+  const L0 = LETTERS[i], L1 = LETTERS[i + 1], n0 = j + 1, n1 = j + 2;
+  return o === 0 ? `${L0}${n0}|${L1}${n0} & ${L0}${n1}|${L1}${n1}`
+                 : `${L0}${n0}|${L0}${n1} & ${L1}${n0}|${L1}${n1}`;
+}
+
+// For the info HUD: each player's distance, and the single legal fence that
+// lengthens it the most.
+function analyse(s) {
+  const d = [dist(s, 0), dist(s, 1)];
+  const best = [{ inc: 0, f: null }, { inc: 0, f: null }];
+  for (let o = 0; o < 2; o++) {
+    const arr = o ? s.v : s.h;
+    for (let i = 0; i < 8; i++) for (let j = 0; j < 8; j++) {
+      if (!fenceFree(s, o, i, j)) continue;
+      arr[i * 8 + j] = 1;
+      const a = dist(s, 0), b = dist(s, 1);
+      arr[i * 8 + j] = 0;
+      if (a >= UNREACH || b >= UNREACH) continue;
+      if (a - d[0] > best[0].inc) best[0] = { inc: a - d[0], f: [o, i, j] };
+      if (b - d[1] > best[1].inc) best[1] = { inc: b - d[1], f: [o, i, j] };
+    }
+  }
+  return { d, best };
+}
+
+/* =====================================================================
+ * Hint search: negamax with alpha-beta and iterative deepening under a
+ * hard time budget. Fence candidates are limited to slots that cut the
+ * opponent's current shortest path, which keeps the branching factor small.
+ * ===================================================================== */
+function suggestMove(src, budgetMs) {
+  const s = cloneState(src);
+  const me = s.turn;
+  const deadline = performance.now() + budgetMs;
+  const TIMEOUT = {};
+  const WIN = 100000;
+  let nodes = 0;
+
+  const evaluate = p => (dist(s, 1 - p) - dist(s, p)) * 10 + (s.left[p] - s.left[1 - p]);
+
+  function gen(p) {
+    const out = [];
+    for (const [r, c] of pawnMoves(s, p)) out.push({ t: 0, r, c });
+    if (s.left[p] > 0) {
+      const seen = new Uint8Array(128);
+      for (const [r, c, d] of pathSteps(s, 1 - p)) for (const [o, i, j] of blockers(r, c, d)) {
+        const key = o * 64 + i * 8 + j;
+        if (seen[key]) continue;
+        seen[key] = 1;
+        if (fenceFree(s, o, i, j)) out.push({ t: 1, o, i, j });
+      }
+    }
+    return out;
+  }
+  // Applies m for player p; returns an undo function, or null if illegal.
+  function play(m, p) {
+    if (m.t === 0) {
+      const r = s.pr[p], c = s.pc[p];
+      s.pr[p] = m.r; s.pc[p] = m.c;
+      return () => { s.pr[p] = r; s.pc[p] = c; };
+    }
+    const arr = m.o ? s.v : s.h, k = m.i * 8 + m.j;
+    arr[k] = 1; s.left[p]--;
+    if (dist(s, 0) >= UNREACH || dist(s, 1) >= UNREACH) { arr[k] = 0; s.left[p]++; return null; }
+    return () => { arr[k] = 0; s.left[p]++; };
+  }
+  function search(depth, alpha, beta, p, ply) {
+    if ((++nodes & 63) === 0 && performance.now() > deadline) throw TIMEOUT;
+    if (s.pr[1 - p] === GOAL[1 - p]) return -(WIN - ply);   // previous mover won
+    if (depth === 0) return evaluate(p);
+    let best = -Infinity;
+    for (const m of gen(p)) {
+      const undo = play(m, p);
+      if (!undo) continue;
+      const v = -search(depth - 1, -beta, -alpha, 1 - p, ply + 1);
+      undo();
+      if (v > best) best = v;
+      if (v > alpha) alpha = v;
+      if (alpha >= beta) break;
+    }
+    return best === -Infinity ? evaluate(p) : best;
+  }
+
+  // Root: pawn moves first, ordered by resulting distance (good for pruning
+  // and makes ties prefer simple progress over spending a fence).
+  let rootMoves = gen(me);
+  const key = m => { if (m.t) return 100; const u = play(m, me); const d = dist(s, me); u(); return d; };
+  rootMoves.sort((a, b) => key(a) - key(b));
+
+  let bestMove = rootMoves[0] || null;
+  for (let depth = 1; depth <= 10; depth++) {
+    try {
+      let alpha = -Infinity, curBest = null;
+      for (const m of rootMoves) {
+        const undo = play(m, me);
+        if (!undo) continue;
+        const v = -search(depth - 1, -Infinity, -alpha, 1 - me, 1);
+        undo();
+        if (v > alpha) { alpha = v; curBest = m; }
+      }
+      if (!curBest) break;
+      bestMove = curBest;
+      rootMoves = [curBest, ...rootMoves.filter(m => m !== curBest)];
+      if (alpha >= WIN - 100) break;   // forced win found
+    } catch (e) {
+      if (e !== TIMEOUT) throw e;
+      break;   // keep the result of the last fully searched depth
+    }
+  }
+  return bestMove;
+}
+
+/* =====================================================================
+ * Small math library (column-major 4x4 matrices, like GLSL)
+ * ===================================================================== */
+const norm = v => { const l = Math.hypot(v[0], v[1], v[2]); return [v[0] / l, v[1] / l, v[2] / l]; };
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const ease = x => x * x * (3 - 2 * x);
+
+function mat4Mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    let s = 0;
+    for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
+    o[c * 4 + r] = s;
+  }
+  return o;
+}
+function perspective(fovy, aspect, n, f) {
+  const t = 1 / Math.tan(fovy / 2), nf = 1 / (n - f);
+  return new Float32Array([t / aspect, 0, 0, 0, 0, t, 0, 0, 0, 0, (f + n) * nf, -1, 0, 0, 2 * f * n * nf, 0]);
+}
+function ortho(l, r, b, t, n, f) {
+  return new Float32Array([2 / (r - l), 0, 0, 0, 0, 2 / (t - b), 0, 0, 0, 0, -2 / (f - n), 0,
+    -(r + l) / (r - l), -(t + b) / (t - b), -(f + n) / (f - n), 1]);
+}
+function lookAt(e, c, up) {
+  const z = norm(sub(e, c)), x = norm(cross(up, z)), y = cross(z, x);
+  return new Float32Array([x[0], y[0], z[0], 0, x[1], y[1], z[1], 0, x[2], y[2], z[2], 0, -dot(x, e), -dot(y, e), -dot(z, e), 1]);
+}
+// Translation * rotation about Y * uniform scale.
+function modelMat(tx, ty, tz, rot = 0, s = 1) {
+  const c = Math.cos(rot) * s, sn = Math.sin(rot) * s;
+  return new Float32Array([c, 0, -sn, 0, 0, s, 0, 0, sn, 0, c, 0, tx, ty, tz, 1]);
+}
+const IDENTITY = modelMat(0, 0, 0);
+
+function hexToLinear(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.pow(v / 255, 2.2));
+}
+
+/* =====================================================================
+ * Scene dimensions (1 world unit = 1 square pitch)
+ * ===================================================================== */
+const TILE = 0.82, TILE_H = 0.08;                  // squares; grooves are 0.18 wide
+const FENCE_LEN = 1.82, FENCE_H = 0.4, FENCE_T = 0.13;
+const SLAB_X = 5.2, SLAB_Z = 7.4, SLAB_H = 0.4;
+const STORE_Z = 6.25;                              // unused fence rows
+const ANIM_MS = 360;                               // move animation (must be <= 400)
+const FOV = 45 * Math.PI / 180;
+const cellX = c => c - 4;
+const cellZ = r => 4 - r;                          // row A nearest to player A's camera (+z)
+
+const PAWN_COLORS = {
+  beige: ['Beige', '#e2cc9f'], brown: ['Brown', '#7a4a28'], ivory: ['Ivory', '#f4ecda'],
+  ebony: ['Ebony', '#2e2522'], cherry: ['Cherry', '#a3322a'], navy: ['Navy', '#2d4277'],
+  forest: ['Forest', '#2f6040'], gold: ['Gold', '#d6a630'], slate: ['Slate', '#6c7884'],
+};
+const COL = {
+  slab: hexToLinear('#4f321e'), tile: hexToLinear('#c39669'), fence: hexToLinear('#94552d'),
+  ground: hexToLinear('#3d3229'), bg: hexToLinear('#141110'),
+  ok: [0.15, 0.85, 0.25], bad: [0.95, 0.12, 0.1], hint: [1.0, 0.8, 0.15], ring: [1.0, 0.78, 0.35],
+};
+
+/* =====================================================================
+ * Settings (persisted when localStorage is available)
+ * ===================================================================== */
+const settings = { labels: true, colorA: 'beige', colorB: 'brown', autoPersp: false };
+try { Object.assign(settings, JSON.parse(localStorage.getItem('quoridor3d.settings') || '{}')); } catch (e) {}
+function saveSettings() { try { localStorage.setItem('quoridor3d.settings', JSON.stringify(settings)); } catch (e) {} }
+
+/* =====================================================================
+ * WebGL setup
+ * ===================================================================== */
+const canvas = document.getElementById('gl');
+const gl = canvas.getContext('webgl2', { antialias: true, alpha: false });
+if (!gl) {
+  const err = document.getElementById('error');
+  err.hidden = false;
+  err.textContent = 'Sorry, this game needs WebGL 2, which is not available in this browser.';
+  throw new Error('WebGL2 unavailable');
+}
+
+const MAIN_VS = `#version 300 es
+layout(location=0) in vec3 a_pos;
+layout(location=1) in vec3 a_nrm;
+layout(location=2) in vec4 a_aux;   // xyz: per-piece grain offset, w: tone variation
+uniform mat4 u_model, u_vp, u_lightVP;
+out vec3 v_world, v_nrm, v_local;
+out vec4 v_aux, v_sh;
+void main() {
+  vec4 w = u_model * vec4(a_pos, 1.0);
+  v_world = w.xyz;
+  v_nrm = mat3(u_model) * a_nrm;    // model matrices are rotation + uniform scale only
+  v_local = a_pos;
+  v_aux = a_aux;
+  v_sh = u_lightVP * w;
+  gl_Position = u_vp * w;
+}`;
+
+const MAIN_FS = `#version 300 es
+precision highp float;
+precision highp sampler2DShadow;
+in vec3 v_world, v_nrm, v_local;
+in vec4 v_aux, v_sh;
+uniform vec3 u_color, u_seed, u_highlight, u_lightDir, u_eye, u_bg;
+uniform int u_mode;          // 0 = wood, 1 = translucent overlay, 2 = ground
+uniform float u_alpha, u_texel;
+uniform sampler2DShadow u_shadow;
+out vec4 o;
+
+// Cheap hash-based 3D value noise (no textures needed).
+float hash(vec3 p) {
+  p = fract(p * 0.3183099 + 0.1);
+  p *= 17.0;
+  return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+float noise(vec3 x) {
+  vec3 i = floor(x), f = fract(x);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(hash(i), hash(i + vec3(1,0,0)), f.x),
+                 mix(hash(i + vec3(0,1,0)), hash(i + vec3(1,1,0)), f.x), f.y),
+             mix(mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x),
+                 mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y), f.z);
+}
+
+// Procedural wood: growth rings are concentric cylinders around an axis
+// parallel to local X. The axis sits far from the piece (via the offsets),
+// so on flat faces the rings read as gently curving stripes, like flat-sawn
+// boards. Low-frequency noise warps the rings; stretched noise adds fibres.
+vec3 wood(vec3 p) {
+  vec3 q = p + u_seed + v_aux.xyz;
+  float w1 = noise(q * vec3(0.5, 2.0, 2.0));
+  float w2 = noise(q * vec3(1.1, 5.0, 5.0));
+  float r = length(q.yz) * 7.0 + w1 * 2.5 + w2 * 0.6;
+  float ring = fract(r);
+  float band = smoothstep(0.0, 0.18, ring) - smoothstep(0.45, 1.0, ring);
+  float fibre = noise(q * vec3(2.0, 26.0, 26.0));
+  float shade = 0.87 + 0.09 * band - 0.05 * fibre + 0.08 * (w1 - 0.5) + 0.06 * v_aux.w;
+  return u_color * shade;
+}
+
+// 4-tap PCF on top of the hardware 2x2 comparison filter.
+float shadowAt() {
+  vec3 p = v_sh.xyz / v_sh.w * 0.5 + 0.5;
+  if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0 || p.z > 1.0) return 1.0;
+  float z = p.z - 0.0012, t = u_texel * 0.9;
+  return 0.25 * (texture(u_shadow, vec3(p.xy + vec2(-t, -t), z)) +
+                 texture(u_shadow, vec3(p.xy + vec2( t, -t), z)) +
+                 texture(u_shadow, vec3(p.xy + vec2(-t,  t), z)) +
+                 texture(u_shadow, vec3(p.xy + vec2( t,  t), z)));
+}
+
+void main() {
+  vec3 N = normalize(v_nrm), L = u_lightDir;
+  float ndl = max(dot(N, L), 0.0);
+  if (u_mode == 1) {
+    vec3 c = u_color * (0.6 + 0.4 * ndl);
+    o = vec4(pow(c, vec3(1.0 / 2.2)), u_alpha);
+    return;
+  }
+  vec3 albedo = u_mode == 0 ? wood(v_local) : u_color;
+  float sh = shadowAt();
+  vec3 V = normalize(u_eye - v_world), H = normalize(L + V);
+  float spec = pow(max(dot(N, H), 0.0), 48.0) * (u_mode == 0 ? 0.16 : 0.02);
+  // Soft lighting: strong ambient, gentler sun, and shadows that only
+  // remove part of the direct light, so dark and shadowed areas stay close.
+  vec3 amb = mix(vec3(0.36, 0.33, 0.31), vec3(0.54, 0.55, 0.58), N.y * 0.5 + 0.5);
+  vec3 col = albedo * (amb + vec3(1.0, 0.95, 0.87) * 1.05 * ndl * mix(0.45, 1.0, sh)) + spec * sh + u_highlight;
+  if (u_mode == 2) {
+    // Floor: a warm pool of light under the board fading out to the background.
+    float d = length(v_world.xz);
+    col *= 1.0 + 0.7 * (1.0 - smoothstep(0.0, 15.0, d));
+    col = mix(col, u_bg, smoothstep(9.0, 28.0, d));
+  }
+  o = vec4(pow(col, vec3(1.0 / 2.2)), 1.0);
+}`;
+
+const SHADOW_VS = `#version 300 es
+layout(location=0) in vec3 a_pos;
+uniform mat4 u_model, u_lightVP;
+void main() { gl_Position = u_lightVP * u_model * vec4(a_pos, 1.0); }`;
+const SHADOW_FS = `#version 300 es
+precision mediump float;
+out vec4 o;
+void main() { o = vec4(1.0); }`;
+
+function makeProgram(vsSrc, fsSrc) {
+  const compile = (type, src) => {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src); gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+    return sh;
+  };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  const u = {};
+  const n = gl.getProgramParameter(prog, gl.ACTIVE_UNIFORMS);
+  for (let k = 0; k < n; k++) { const name = gl.getActiveUniform(prog, k).name; u[name] = gl.getUniformLocation(prog, name); }
+  return { prog, u };
+}
+const mainP = makeProgram(MAIN_VS, MAIN_FS);
+const shadowP = makeProgram(SHADOW_VS, SHADOW_FS);
+
+/* ---------- Geometry ---------- */
+class MeshBuilder {
+  constructor() { this.v = []; this.idx = []; this.n = 0; }
+  vert(p, nr, aux) { this.v.push(p[0], p[1], p[2], nr[0], nr[1], nr[2], aux[0], aux[1], aux[2], aux[3]); return this.n++; }
+  quad(a, b, c, d) { this.idx.push(a, b, c, a, c, d); }
+  // Axis-aligned box centred at (cx,cy,cz) with full sizes (sx,sy,sz).
+  box(cx, cy, cz, sx, sy, sz, aux = [0, 0, 0, 0]) {
+    const h = [sx / 2, sy / 2, sz / 2];
+    for (const [a, u, w] of [[0, 1, 2], [1, 2, 0], [2, 0, 1]]) for (const sg of [1, -1]) {
+      const nr = [0, 0, 0]; nr[a] = sg;
+      const ids = [];
+      for (const [su, sw] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+        const p = [cx, cy, cz];
+        p[a] += sg * h[a]; p[u] += su * h[u]; p[w] += sw * h[w];
+        ids.push(this.vert(p, nr, aux));
+      }
+      this.quad(...ids);
+    }
+  }
+  // Surface of revolution around Y from a [radius, y] profile (flat-shaded per segment).
+  lathe(profile, segs, aux = [0, 0, 0, 0]) {
+    for (let k = 0; k < profile.length - 1; k++) {
+      const [r0, y0] = profile[k], [r1, y1] = profile[k + 1];
+      let nr = y1 - y0, ny = -(r1 - r0);
+      const l = Math.hypot(nr, ny); nr /= l; ny /= l;
+      const base = this.n;
+      for (let s = 0; s <= segs; s++) {
+        const a = s / segs * Math.PI * 2, ca = Math.cos(a), sa = Math.sin(a);
+        this.vert([r0 * ca, y0, r0 * sa], [nr * ca, ny, nr * sa], aux);
+        this.vert([r1 * ca, y1, r1 * sa], [nr * ca, ny, nr * sa], aux);
+      }
+      for (let s = 0; s < segs; s++) { const i = base + s * 2; this.quad(i, i + 2, i + 3, i + 1); }
+    }
+  }
+  sphere(cx, cy, cz, R, lat, lon, aux = [0, 0, 0, 0]) {
+    const base = this.n;
+    for (let i = 0; i <= lat; i++) {
+      const th = i / lat * Math.PI;
+      for (let j = 0; j <= lon; j++) {
+        const ph = j / lon * Math.PI * 2;
+        const n = [Math.sin(th) * Math.cos(ph), Math.cos(th), Math.sin(th) * Math.sin(ph)];
+        this.vert([cx + R * n[0], cy + R * n[1], cz + R * n[2]], n, aux);
+      }
+    }
+    for (let i = 0; i < lat; i++) for (let j = 0; j < lon; j++) {
+      const a = base + i * (lon + 1) + j;
+      this.quad(a, a + 1, a + lon + 2, a + lon + 1);
+    }
+  }
+  // Flat annulus (r0 = 0 gives a disc) facing up at y = 0.
+  ring(r0, r1, segs) {
+    const base = this.n;
+    for (let s = 0; s <= segs; s++) {
+      const a = s / segs * Math.PI * 2, ca = Math.cos(a), sa = Math.sin(a);
+      this.vert([r0 * ca, 0, r0 * sa], [0, 1, 0], [0, 0, 0, 0]);
+      this.vert([r1 * ca, 0, r1 * sa], [0, 1, 0], [0, 0, 0, 0]);
+    }
+    for (let s = 0; s < segs; s++) { const i = base + s * 2; this.quad(i, i + 2, i + 3, i + 1); }
+  }
+  upload() {
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(this.v), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 40, 0);
+    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 40, 12);
+    gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 40, 24);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint32Array(this.idx), gl.STATIC_DRAW);
+    gl.bindVertexArray(null);
+    return { vao, count: this.idx.length };
+  }
+}
+
+// Deterministic PRNG so the board looks the same every time.
+let seedState = 1234567;
+const rand = () => ((seedState = (seedState * 1103515245 + 12345) >>> 0) / 4294967296);
+
+const meshes = {};
+{
+  let b = new MeshBuilder();
+  b.box(0, -SLAB_H / 2, 0, SLAB_X * 2, SLAB_H, SLAB_Z * 2, [3.1, 6.3, 11.7, 0]);
+  meshes.slab = b.upload();
+
+  // All 81 squares in one mesh; each gets its own grain offset and tone.
+  b = new MeshBuilder();
+  for (let r = 0; r < 9; r++) for (let c = 0; c < 9; c++)
+    b.box(cellX(c), TILE_H / 2, cellZ(r), TILE, TILE_H, TILE,
+      [rand() * 40 - 20, 6 + rand() * 8, 6 + rand() * 8, rand() - 0.5]);
+  meshes.tiles = b.upload();
+
+  b = new MeshBuilder();
+  b.box(0, FENCE_H / 2, 0, FENCE_LEN, FENCE_H, FENCE_T);   // long axis = local X
+  meshes.fence = b.upload();
+
+  // Pawn: truncated cone body on a small plinth, sphere head.
+  b = new MeshBuilder();
+  b.lathe([[0, 0], [0.31, 0], [0.31, 0.05], [0.28, 0.08], [0.13, 0.64], [0.0, 0.64]], 48);
+  b.sphere(0, 0.82, 0, 0.2, 24, 48);
+  meshes.pawn = b.upload();
+
+  b = new MeshBuilder(); b.ring(0.36, 0.43, 48); meshes.ring = b.upload();
+  b = new MeshBuilder(); b.ring(0, 0.13, 32); meshes.dot = b.upload();
+
+  b = new MeshBuilder();
+  b.v.push(-60, -SLAB_H, -60, 0, 1, 0, 0, 0, 0, 0, 60, -SLAB_H, -60, 0, 1, 0, 0, 0, 0, 0,
+            60, -SLAB_H, 60, 0, 1, 0, 0, 0, 0, 0, -60, -SLAB_H, 60, 0, 1, 0, 0, 0, 0, 0);
+  b.n = 4; b.quad(0, 1, 2, 3);
+  meshes.ground = b.upload();
+}
+
+/* ---------- Shadow map ---------- */
+const SM = 2048;
+const shadowTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, shadowTex);
+gl.texStorage2D(gl.TEXTURE_2D, 1, gl.DEPTH_COMPONENT24, SM, SM);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_MODE, gl.COMPARE_REF_TO_TEXTURE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_FUNC, gl.LEQUAL);
+const shadowFB = gl.createFramebuffer();
+gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFB);
+gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, shadowTex, 0);
+gl.drawBuffers([gl.NONE]);
+gl.readBuffer(gl.NONE);
+gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+const LIGHT_DIR = norm([-0.45, 1.0, 0.6]);     // direction towards the light
+const lightVP = mat4Mul(ortho(-10, 10, -10, 10, 1, 45),
+  lookAt([LIGHT_DIR[0] * 22, LIGHT_DIR[1] * 22, LIGHT_DIR[2] * 22], [0, 0, 0], [0, 1, 0]));
+
+/* =====================================================================
+ * Game + visual state
+ * ===================================================================== */
+let game = newState();
+let vis;                 // positions of everything drawn (decoupled from game state for animation)
+let sel = null;          // {type:'pawn', moves} | {type:'fence', idx}
+let ghost = null;        // {type:'pawn', r, c, ok} | {type:'fence', o, i, j, ok}
+let hover = null;        // selectable object under the cursor when nothing is selected
+let busy = false;        // true while a move animation runs
+let hint = null;         // {move, start} flashing suggestion
+
+function storePos(owner, k) {
+  return owner === 0 ? { x: -4.05 + k * 0.9, z: STORE_Z } : { x: 4.05 - k * 0.9, z: -STORE_Z };
+}
+function fenceWorld(o, i, j) {
+  return { x: j - 3.5, z: 3.5 - i, rot: o === 0 ? 0 : Math.PI / 2 };
+}
+function resetVisuals() {
+  vis = {
+    pawns: [0, 1].map(p => ({ x: cellX(game.pc[p]), y: TILE_H, z: cellZ(game.pr[p]), seed: [p * 7.3, 2.1, 3.7] })),
+    fences: [],
+  };
+  for (let owner = 0; owner < 2; owner++) for (let k = 0; k < 10; k++) {
+    const sp = storePos(owner, k);
+    vis.fences.push({ owner, x: sp.x, y: 0, z: sp.z, rot: Math.PI / 2, placed: false,
+      seed: [rand() * 30, 5 + rand() * 6, 5 + rand() * 6] });
+  }
+}
+resetVisuals();
+
+/* =====================================================================
+ * Camera: orbit around a target point on the board
+ * ===================================================================== */
+const DEFAULT_PITCH = 0.6;
+const cam = { yaw: 0, pitch: DEFAULT_PITCH, dist: 17, tx: 0, tz: 0 };
+let camAnim = null;
+function camEye() {
+  const cp = Math.cos(cam.pitch);
+  return [cam.tx + cam.dist * Math.sin(cam.yaw) * cp, cam.dist * Math.sin(cam.pitch), cam.tz + cam.dist * Math.cos(cam.yaw) * cp];
+}
+function fitDist() {
+  const aspect = canvas.clientWidth / Math.max(1, canvas.clientHeight);
+  const hHalf = Math.atan(Math.tan(FOV / 2) * aspect);
+  return Math.max(18, 5.8 / Math.tan(hHalf) + 4);
+}
+// Smoothly move the camera to player p's side (p=0: A's rows nearest).
+function setView(p, instant = false) {
+  let yaw = p === 0 ? 0 : Math.PI;
+  yaw += Math.round((cam.yaw - yaw) / (2 * Math.PI)) * 2 * Math.PI;   // shortest way round
+  const to = { yaw, pitch: DEFAULT_PITCH, dist: fitDist(), tx: 0, tz: 0 };
+  if (instant) { Object.assign(cam, to); camAnim = null; requestRender(); return; }
+  camAnim = { from: { ...cam }, to, t0: performance.now(), dur: 550 };
+  requestRender();
+}
+
+/* =====================================================================
+ * Rendering
+ * ===================================================================== */
+let lastVP = null, lastEye = [0, 0, 0];
+const dpr = () => Math.min(window.devicePixelRatio || 1, 1.5);   // cap for older GPUs
+
+function setObjUniforms(u, color, seed, hl) {
+  gl.uniform3fv(u.u_color, color);
+  gl.uniform3fv(u.u_seed, seed || [0, 0, 0]);
+  gl.uniform3fv(u.u_highlight, hl || [0, 0, 0]);
+}
+function drawMesh(mesh) {
+  gl.bindVertexArray(mesh.vao);
+  gl.drawElements(gl.TRIANGLES, mesh.count, gl.UNSIGNED_INT, 0);
+}
+
+function pawnColor(p) { return hexToLinear(PAWN_COLORS[p === 0 ? settings.colorA : settings.colorB][1]); }
+
+// Every opaque wooden object for this frame.
+function sceneObjects() {
+  const objs = [
+    { mesh: meshes.slab, model: IDENTITY, color: COL.slab },
+    { mesh: meshes.tiles, model: IDENTITY, color: COL.tile },
+  ];
+  vis.fences.forEach((f, idx) => {
+    const selected = sel && sel.type === 'fence' && sel.idx === idx;
+    const hovered = hover && hover.type === 'fence' && hover.idx === idx;
+    objs.push({ mesh: meshes.fence, model: modelMat(f.x, f.y + (selected ? 0.18 : 0), f.z, f.rot), color: COL.fence, seed: f.seed,
+      hl: selected ? [0.11, 0.09, 0.05] : hovered ? [0.05, 0.05, 0.03] : null });
+  });
+  vis.pawns.forEach((pw, p) => {
+    const selected = sel && sel.type === 'pawn' && game.turn === p;
+    const hovered = hover && hover.type === 'pawn' && game.turn === p;
+    objs.push({ mesh: meshes.pawn, model: modelMat(pw.x, pw.y, pw.z), color: pawnColor(p), seed: pw.seed,
+      hl: selected ? [0.11, 0.09, 0.05] : hovered ? [0.05, 0.05, 0.03] : null });
+  });
+  return objs;
+}
+
+// Translucent overlays: [mesh, model, color, alpha].
+function overlayList(now) {
+  const decals = [], ghosts = [];
+  if (!busy && game.winner < 0) {
+    const pw = vis.pawns[game.turn];
+    decals.push([meshes.ring, modelMat(pw.x, TILE_H + 0.004, pw.z), COL.ring, 0.75]);
+  }
+  if (sel && sel.type === 'pawn')
+    for (const [r, c] of sel.moves) decals.push([meshes.dot, modelMat(cellX(c), TILE_H + 0.004, cellZ(r)), COL.ok, 0.35]);
+  const addMove = (m, color, alpha) => {
+    if (m.type === 'pawn') ghosts.push([meshes.pawn, modelMat(cellX(m.c), TILE_H + 0.002, cellZ(m.r)), color, alpha]);
+    else { const w = fenceWorld(m.o, m.i, m.j); ghosts.push([meshes.fence, modelMat(w.x, 0.01, w.z, w.rot, 1.02), color, alpha]); }
+  };
+  if (ghost) addMove(ghost, ghost.ok ? COL.ok : COL.bad, 0.55);
+  if (hint) {
+    // Two flashes, gone after 380 ms: on 0-140, off 140-240, on 240-380.
+    const t = now - hint.start;
+    if (t < 140 || (t >= 240 && t < 380)) addMove(hint.move, COL.hint, 0.75);
+  }
+  return { decals, ghosts };
+}
+
+function resize() {
+  const w = Math.round(canvas.clientWidth * dpr()), h = Math.round(canvas.clientHeight * dpr());
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+}
+
+function draw(now) {
+  resize();
+  const W = canvas.width, H = canvas.height;
+  const eye = camEye();
+  const vp = mat4Mul(perspective(FOV, W / H, 0.3, 120), lookAt(eye, [cam.tx, 0, cam.tz], [0, 1, 0]));
+  lastVP = vp; lastEye = eye;
+  const objs = sceneObjects();
+
+  gl.enable(gl.DEPTH_TEST);
+  gl.disable(gl.CULL_FACE);
+
+  // Pass 1: shadow map from the light's point of view.
+  gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFB);
+  gl.viewport(0, 0, SM, SM);
+  gl.clear(gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(shadowP.prog);
+  gl.uniformMatrix4fv(shadowP.u.u_lightVP, false, lightVP);
+  gl.enable(gl.POLYGON_OFFSET_FILL);
+  gl.polygonOffset(1.5, 3);
+  for (const o of objs) { gl.uniformMatrix4fv(shadowP.u.u_model, false, o.model); drawMesh(o.mesh); }
+  gl.disable(gl.POLYGON_OFFSET_FILL);
+
+  // Pass 2: the scene.
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, W, H);
+  const bg = COL.bg.map(v => Math.pow(v, 1 / 2.2));
+  gl.clearColor(bg[0], bg[1], bg[2], 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  const u = mainP.u;
+  gl.useProgram(mainP.prog);
+  gl.uniformMatrix4fv(u.u_vp, false, vp);
+  gl.uniformMatrix4fv(u.u_lightVP, false, lightVP);
+  gl.uniform3fv(u.u_lightDir, LIGHT_DIR);
+  gl.uniform3fv(u.u_eye, eye);
+  gl.uniform3fv(u.u_bg, COL.bg);
+  gl.uniform1f(u.u_texel, 1 / SM);
+  gl.uniform1f(u.u_alpha, 1);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, shadowTex);
+  gl.uniform1i(u.u_shadow, 0);
+
+  gl.uniform1i(u.u_mode, 2);
+  gl.uniformMatrix4fv(u.u_model, false, IDENTITY);
+  setObjUniforms(u, COL.ground);
+  drawMesh(meshes.ground);
+
+  gl.uniform1i(u.u_mode, 0);
+  for (const o of objs) {
+    gl.uniformMatrix4fv(u.u_model, false, o.model);
+    setObjUniforms(u, o.color, o.seed, o.hl);
+    drawMesh(o.mesh);
+  }
+
+  // Pass 3: translucent overlays.
+  const { decals, ghosts } = overlayList(now);
+  gl.uniform1i(u.u_mode, 1);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.depthMask(false);
+  for (const [mesh, model, color, alpha] of decals) {
+    gl.uniformMatrix4fv(u.u_model, false, model); setObjUniforms(u, color); gl.uniform1f(u.u_alpha, alpha); drawMesh(mesh);
+  }
+  gl.depthMask(true);
+  // Ghosts: depth pre-pass first so only the front-most layer of a ghost is
+  // blended (otherwise the head inside the body would double up the alpha).
+  for (const [mesh, model, color, alpha] of ghosts) {
+    gl.uniformMatrix4fv(u.u_model, false, model); setObjUniforms(u, color); gl.uniform1f(u.u_alpha, alpha);
+    gl.colorMask(false, false, false, false); drawMesh(mesh);
+    gl.colorMask(true, true, true, true); gl.depthFunc(gl.LEQUAL); drawMesh(mesh); gl.depthFunc(gl.LESS);
+  }
+  gl.disable(gl.BLEND);
+  gl.bindVertexArray(null);
+
+  updateLabels(vp);
+}
+
+/* ---------- Board labels: HTML overlays at projected 3D positions, so they never rotate ---------- */
+const labelBox = document.getElementById('labels');
+const labels = [];
+for (let r = 0; r < 9; r++) for (const s of [-1, 1]) labels.push({ text: LETTERS[r], x: s * 4.85, z: cellZ(r) });
+for (let c = 0; c < 9; c++) for (const s of [-1, 1]) labels.push({ text: String(c + 1), x: cellX(c), z: s * 4.85 });
+for (const l of labels) { l.el = document.createElement('div'); l.el.className = 'lbl'; l.el.textContent = l.text; labelBox.appendChild(l.el); }
+
+function updateLabels(vp) {
+  labelBox.hidden = !settings.labels;
+  if (!settings.labels) return;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  for (const l of labels) {
+    const x = l.x, y = 0.01, z = l.z;
+    const cx = vp[0] * x + vp[4] * y + vp[8] * z + vp[12];
+    const cy = vp[1] * x + vp[5] * y + vp[9] * z + vp[13];
+    const cw = vp[3] * x + vp[7] * y + vp[11] * z + vp[15];
+    if (cw <= 0.1) { l.el.style.display = 'none'; continue; }
+    l.el.style.display = '';
+    const sx = (cx / cw * 0.5 + 0.5) * w, sy = (0.5 - cy / cw * 0.5) * h;
+    // Scale the font with perspective so distant labels shrink too.
+    const fs = clamp(300 / cw * Math.min(1, h / 700 + 0.3), 9, 24);
+    l.el.style.fontSize = fs.toFixed(1) + 'px';
+    l.el.style.transform = `translate(${sx.toFixed(1)}px, ${sy.toFixed(1)}px) translate(-50%, -50%)`;
+  }
+}
+
+/* ---------- Frame loop: renders on demand, keeps going only while something animates ---------- */
+const anims = [];
+let rafPending = false;
+function requestRender() { if (!rafPending) { rafPending = true; requestAnimationFrame(frame); } }
+function animate(dur, step, done) { anims.push({ t0: performance.now(), dur, step, done }); requestRender(); }
+function frame(now) {
+  rafPending = false;
+  for (let k = anims.length - 1; k >= 0; k--) {
+    const a = anims[k], t = clamp((now - a.t0) / a.dur, 0, 1);
+    a.step(t);
+    if (t >= 1) { anims.splice(k, 1); if (a.done) a.done(); }
+  }
+  if (camAnim) {
+    const t = clamp((now - camAnim.t0) / camAnim.dur, 0, 1), e = ease(t);
+    for (const k of ['yaw', 'pitch', 'dist', 'tx', 'tz']) cam[k] = lerp(camAnim.from[k], camAnim.to[k], e);
+    if (t >= 1) camAnim = null;
+  }
+  if (hint && now - hint.start > 400) hint = null;
+  draw(now);
+  if (anims.length || camAnim || hint) requestRender();
+}
+
+// "Lift, move, drift down": returns horizontal progress and lift height for t in [0,1].
+function hop(t, lift) {
+  const y = t < 0.25 ? ease(t / 0.25) : t > 0.75 ? ease((1 - t) / 0.25) : 1;
+  return { h: ease(clamp((t - 0.15) / 0.7, 0, 1)), y: y * lift };
+}
+
+/* =====================================================================
+ * Turn logic
+ * ===================================================================== */
+function commitPawn(r, c) {
+  const p = game.turn, pw = vis.pawns[p];
+  const fx = pw.x, fz = pw.z, tx = cellX(c), tz = cellZ(r);
+  game.pr[p] = r; game.pc[p] = c;
+  busy = true; sel = null; ghost = null;
+  animate(ANIM_MS, t => {
+    const k = hop(t, 0.7);
+    pw.x = lerp(fx, tx, k.h); pw.z = lerp(fz, tz, k.h); pw.y = TILE_H + k.y;
+  }, endTurn);
+}
+function commitFence(idx, o, i, j) {
+  const p = game.turn, f = vis.fences[idx], w = fenceWorld(o, i, j);
+  (o ? game.v : game.h)[i * 8 + j] = 1;
+  game.left[p]--;
+  f.placed = true;
+  const fx = f.x, fz = f.z, fr = f.rot;
+  busy = true; sel = null; ghost = null;
+  animate(ANIM_MS, t => {
+    const k = hop(t, 0.9);
+    f.x = lerp(fx, w.x, k.h); f.z = lerp(fz, w.z, k.h); f.rot = lerp(fr, w.rot, k.h); f.y = k.y;
+  }, endTurn);
+}
+function endTurn() {
+  const p = game.turn;
+  if (game.pr[p] === GOAL[p]) {
+    game.winner = p;
+    document.getElementById('bannerText').textContent = `Player ${'AB'[p]} wins!`;
+    document.getElementById('banner').hidden = false;
+  } else {
+    game.turn = 1 - p;
+    if (settings.autoPersp) setView(game.turn);
+  }
+  busy = false;
+  updateHud();
+  requestRender();
+}
+function newGame() {
+  game = newState();
+  sel = ghost = hover = hint = null;
+  anims.length = 0; busy = false;
+  resetVisuals();
+  document.getElementById('banner').hidden = true;
+  setView(0);
+  updateHud();
+}
+
+/* =====================================================================
+ * Input
+ * ===================================================================== */
+function rayFromEvent(e) {
+  const rect = canvas.getBoundingClientRect();
+  const nx = ((e.clientX - rect.left) / rect.width) * 2 - 1, ny = 1 - ((e.clientY - rect.top) / rect.height) * 2;
+  const eye = camEye(), fwd = norm(sub([cam.tx, 0, cam.tz], eye));
+  const right = norm(cross(fwd, [0, 1, 0])), up = cross(right, fwd);
+  const th = Math.tan(FOV / 2), aspect = rect.width / rect.height;
+  const d = norm([0, 1, 2].map(k => fwd[k] + right[k] * nx * th * aspect + up[k] * ny * th));
+  return { o: eye, d };
+}
+function rayBox(ray, min, max) {
+  let t0 = -Infinity, t1 = Infinity;
+  for (let a = 0; a < 3; a++) {
+    if (Math.abs(ray.d[a]) < 1e-9) { if (ray.o[a] < min[a] || ray.o[a] > max[a]) return null; continue; }
+    let ta = (min[a] - ray.o[a]) / ray.d[a], tb = (max[a] - ray.o[a]) / ray.d[a];
+    if (ta > tb) [ta, tb] = [tb, ta];
+    t0 = Math.max(t0, ta); t1 = Math.min(t1, tb);
+    if (t0 > t1) return null;
+  }
+  return t1 < 0 ? null : t0;
+}
+// The current player's pawn or one of their unused fences under the ray.
+function pickSelectable(ray) {
+  if (busy || game.winner >= 0) return null;
+  let best = null, bestT = Infinity;
+  const pw = vis.pawns[game.turn];
+  const tp = rayBox(ray, [pw.x - 0.33, 0, pw.z - 0.33], [pw.x + 0.33, 1.05, pw.z + 0.33]);
+  if (tp !== null && tp < bestT) { bestT = tp; best = { type: 'pawn' }; }
+  vis.fences.forEach((f, idx) => {
+    if (f.placed || f.owner !== game.turn) return;
+    const t = rayBox(ray, [f.x - 0.2, 0, f.z - FENCE_LEN / 2], [f.x + 0.2, FENCE_H + 0.05, f.z + FENCE_LEN / 2]);
+    if (t !== null && t < bestT) { bestT = t; best = { type: 'fence', idx }; }
+  });
+  return best;
+}
+// Board coordinates (continuous; square centres at integers) under the ray.
+function boardHit(ray) {
+  if (ray.d[1] >= -1e-6) return null;
+  const t = (TILE_H - ray.o[1]) / ray.d[1];
+  const x = ray.o[0] + ray.d[0] * t, z = ray.o[2] + ray.d[2] * t;
+  return { col: x + 4, row: 4 - z };
+}
+function computeGhost(ray) {
+  const b = boardHit(ray);
+  if (!b || b.col < -0.5 || b.col > 8.5 || b.row < -0.5 || b.row > 8.5) return null;
+  if (sel.type === 'pawn') {
+    const r = Math.round(b.row), c = Math.round(b.col);
+    return { type: 'pawn', r, c, ok: sel.moves.some(([mr, mc]) => mr === r && mc === c) };
+  }
+  // Fences: grooves sit at half-integers. Pick the nearest groove slot along
+  // each axis; the orientation follows whichever groove line the cursor is
+  // closest to (near a horizontal groove -> horizontal fence).
+  const fr = b.row - 0.5, fc = b.col - 0.5;
+  const i = clamp(Math.round(fr), 0, 7), j = clamp(Math.round(fc), 0, 7);
+  const o = Math.abs(fr - Math.round(fr)) < Math.abs(fc - Math.round(fc)) ? 0 : 1;
+  return { type: 'fence', o, i, j, ok: game.left[game.turn] > 0 && fenceLegal(game, o, i, j) };
+}
+function sameGhost(a, b) {
+  if (!a || !b) return a === b;
+  return a.type === b.type && a.ok === b.ok && (a.type === 'pawn' ? a.r === b.r && a.c === b.c : a.o === b.o && a.i === b.i && a.j === b.j);
+}
+function cancelSelection() { if (sel) { sel = null; ghost = null; requestRender(); } }
+
+function onHover(e) {
+  const ray = rayFromEvent(e);
+  if (sel) {
+    const g = computeGhost(ray);
+    if (!sameGhost(g, ghost)) { ghost = g; requestRender(); }
+    canvas.style.cursor = 'pointer';
+  } else {
+    const hv = pickSelectable(ray);
+    if (JSON.stringify(hv) !== JSON.stringify(hover)) { hover = hv; requestRender(); }
+    canvas.style.cursor = hv ? 'pointer' : 'grab';
+  }
+}
+function onClick(e) {
+  if (busy || game.winner >= 0) return;
+  const ray = rayFromEvent(e);
+  if (!sel) {
+    const hit = pickSelectable(ray);
+    if (!hit) return;
+    sel = hit.type === 'pawn' ? { type: 'pawn', moves: pawnMoves(game, game.turn) } : hit;
+    hover = null;
+    ghost = computeGhost(ray);
+    requestRender();
+    return;
+  }
+  const g = computeGhost(ray);
+  if (g && g.ok) {
+    if (g.type === 'pawn') commitPawn(g.r, g.c);
+    else commitFence(sel.idx, g.o, g.i, g.j);
+  } else cancelSelection();
+}
+
+const ptr = { down: false, x: 0, y: 0, x0: 0, y0: 0, drag: false, pan: false };
+canvas.addEventListener('pointerdown', e => {
+  if (e.button === 2) { cancelSelection(); return; }
+  if (e.button !== 0 && e.button !== 1) return;
+  canvas.setPointerCapture(e.pointerId);
+  Object.assign(ptr, { down: true, x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, drag: false, pan: e.button === 1 || e.shiftKey });
+});
+canvas.addEventListener('pointermove', e => {
+  if (!ptr.down) { onHover(e); return; }
+  if (!ptr.drag && Math.hypot(e.clientX - ptr.x0, e.clientY - ptr.y0) > 5) { ptr.drag = true; camAnim = null; canvas.style.cursor = 'grabbing'; }
+  if (!ptr.drag) return;
+  const dx = e.clientX - ptr.x, dy = e.clientY - ptr.y;
+  ptr.x = e.clientX; ptr.y = e.clientY;
+  if (ptr.pan) {
+    // Translate the orbit target across the board plane.
+    const k = cam.dist * 0.0016, s = Math.sin(cam.yaw), c = Math.cos(cam.yaw);
+    cam.tx = clamp(cam.tx - (c * dx + s * dy) * k, -8, 8);
+    cam.tz = clamp(cam.tz - (-s * dx + c * dy) * k, -10, 10);
+  } else {
+    cam.yaw -= dx * 0.007;
+    cam.pitch = clamp(cam.pitch + dy * 0.005, 0.12, 1.53);
+  }
+  requestRender();
+});
+canvas.addEventListener('pointerup', e => {
+  if (!ptr.down) return;
+  ptr.down = false;
+  if (!ptr.drag && e.button === 0) onClick(e);
+  onHover(e);
+});
+canvas.addEventListener('pointercancel', () => { ptr.down = false; });
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  camAnim = null;
+  cam.dist = clamp(cam.dist * Math.exp(e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0012)), 7, 45);
+  requestRender();
+}, { passive: false });
+window.addEventListener('resize', requestRender);
+
+/* ---------- Secret help: type "iamstupid" within 3 s ---------- */
+const SECRET = 'iamstupid';
+const keyLog = [];
+window.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { cancelSelection(); return; }
+  if (e.key.length !== 1 || e.ctrlKey || e.metaKey || e.altKey) return;
+  keyLog.push({ k: e.key.toLowerCase(), t: e.timeStamp });
+  if (keyLog.length > SECRET.length) keyLog.shift();
+  if (keyLog.length === SECRET.length && keyLog.map(o => o.k).join('') === SECRET &&
+      keyLog[keyLog.length - 1].t - keyLog[0].t <= 3000) {
+    keyLog.length = 0;
+    if (busy || game.winner >= 0) return;
+    const m = suggestMove(game, 750);
+    if (!m) return;
+    hint = { move: m.t === 0 ? { type: 'pawn', r: m.r, c: m.c } : { type: 'fence', o: m.o, i: m.i, j: m.j }, start: performance.now() };
+    requestRender();
+  }
+});
+
+/* =====================================================================
+ * HUD + settings
+ * ===================================================================== */
+const hudEl = document.getElementById('hud'), settingsEl = document.getElementById('settings');
+const btnInfo = document.getElementById('btnInfo'), btnSettings = document.getElementById('btnSettings');
+
+function playerLabel(p) {
+  const [name, hex] = PAWN_COLORS[p === 0 ? settings.colorA : settings.colorB];
+  return `<span class="swatch" style="background:${hex}"></span><b>Player ${'AB'[p]}</b> (${name})`;
+}
+function updateHud() {
+  if (hudEl.hidden) return;
+  const a = analyse(game);
+  let html = '<h2>Information</h2>';
+  html += game.winner >= 0 ? `<div>${playerLabel(game.winner)} has won.</div>`
+                           : `<div>Turn: ${playerLabel(game.turn)}</div>`;
+  for (let p = 0; p < 2; p++) {
+    const b = a.best[p], opp = 1 - p;
+    html += `<div class="hud-player">${playerLabel(p)} · ${game.left[p]} fence${game.left[p] === 1 ? '' : 's'} left`;
+    html += `<div>Shortest distance to goal: <b>${a.d[p]}</b> move${a.d[p] === 1 ? '' : 's'}</div>`;
+    html += b.inc > 0
+      ? `<div class="hud-sub">A single fence can lengthen this by <b>+${b.inc}</b>, e.g. ${fenceName(...b.f)}${game.left[opp] === 0 ? ` (but Player ${'AB'[opp]} has no fences left)` : ''}.</div>`
+      : `<div class="hud-sub">No single fence can lengthen this path.</div>`;
+    html += '</div>';
+  }
+  hudEl.innerHTML = html;
+}
+btnInfo.addEventListener('click', () => {
+  hudEl.hidden = !hudEl.hidden;
+  if (!hudEl.hidden) { settingsEl.hidden = true; btnSettings.setAttribute('aria-pressed', 'false'); }
+  btnInfo.setAttribute('aria-pressed', String(!hudEl.hidden));
+  updateHud();
+});
+btnSettings.addEventListener('click', () => {
+  settingsEl.hidden = !settingsEl.hidden;
+  if (!settingsEl.hidden) { hudEl.hidden = true; btnInfo.setAttribute('aria-pressed', 'false'); }
+  btnSettings.setAttribute('aria-pressed', String(!settingsEl.hidden));
+});
+document.getElementById('btnViewA').addEventListener('click', () => setView(0));
+document.getElementById('btnViewB').addEventListener('click', () => setView(1));
+document.getElementById('btnNewGame').addEventListener('click', newGame);
+document.getElementById('btnPlayAgain').addEventListener('click', newGame);
+
+const optLabels = document.getElementById('optLabels'), optAuto = document.getElementById('optAuto');
+const optColor = [document.getElementById('optColorA'), document.getElementById('optColorB')];
+for (const s of optColor) for (const [key, [name]] of Object.entries(PAWN_COLORS)) s.add(new Option(name, key));
+if (!PAWN_COLORS[settings.colorA]) settings.colorA = 'beige';
+if (!PAWN_COLORS[settings.colorB]) settings.colorB = 'brown';
+optLabels.checked = settings.labels;
+optAuto.checked = settings.autoPersp;
+optColor[0].value = settings.colorA;
+optColor[1].value = settings.colorB;
+optLabels.addEventListener('change', () => { settings.labels = optLabels.checked; saveSettings(); requestRender(); });
+optAuto.addEventListener('change', () => {
+  settings.autoPersp = optAuto.checked; saveSettings();
+  if (settings.autoPersp && game.winner < 0) setView(game.turn);
+});
+optColor.forEach((s, p) => s.addEventListener('change', () => {
+  settings[p ? 'colorB' : 'colorA'] = s.value; saveSettings(); updateHud(); requestRender();
+}));
+
+setView(settings.autoPersp ? game.turn : 0, true);
+</script>
+</body>
+</html>
