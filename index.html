@@ -398,13 +398,22 @@ function hexToLinear(hex) {
   const n = parseInt(hex.slice(1), 16);
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.pow(v / 255, 2.2));
 }
+// Linear color -> displayed sRGB-ish value, through the same tone curve as
+// the shader (keeps the clear color matching where the floor fades out).
+function displayColor(lin) {
+  return lin.map(v => {
+    const x = v * EXPOSURE;
+    return Math.pow(clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0, 1), 1 / 2.2);
+  });
+}
 
 /* =====================================================================
  * Scene dimensions (1 world unit = 1 square pitch)
  * ===================================================================== */
 const TILE = 0.82, TILE_H = 0.08;                  // squares; grooves are 0.18 wide
+const TILE_BEV = 0.022;                            // edge rounding of the squares
 const FENCE_LEN = 1.82, FENCE_H = 0.4, FENCE_T = 0.13;
-const SLAB_X = 5.2, SLAB_Z = 7.4, SLAB_H = 0.4;
+const SLAB_X = 5.2, SLAB_Z = 7.6, SLAB_H = 0.4;
 const STORE_Z = 6.25;                              // unused fence rows
 const ANIM_MS = 360;                               // move animation (must be <= 400)
 const FOV = 45 * Math.PI / 180;
@@ -418,14 +427,14 @@ const PAWN_COLORS = {
 };
 const COL = {
   slab: hexToLinear('#4f321e'), tile: hexToLinear('#c39669'), fence: hexToLinear('#94552d'),
-  ground: hexToLinear('#3d3229'), bg: hexToLinear('#141110'),
+  ground: hexToLinear('#2c4a3a'), bg: hexToLinear('#1a1d1b'),
   ok: [0.15, 0.85, 0.25], bad: [0.95, 0.12, 0.1], hint: [1.0, 0.8, 0.15], ring: [1.0, 0.78, 0.35],
 };
 
 /* =====================================================================
  * Settings (persisted when localStorage is available)
  * ===================================================================== */
-const settings = { labels: true, colorA: 'beige', colorB: 'brown', autoPersp: false };
+const settings = { labels: false, colorA: 'beige', colorB: 'brown', autoPersp: true };
 try { Object.assign(settings, JSON.parse(localStorage.getItem('quoridor3d.settings') || '{}')); } catch (e) {}
 function saveSettings() { try { localStorage.setItem('quoridor3d.settings', JSON.stringify(settings)); } catch (e) {} }
 
@@ -441,17 +450,23 @@ if (!gl) {
   throw new Error('WebGL2 unavailable');
 }
 
+// Shadow-map light frustum (orthographic). The shaders need it to turn depth
+// differences into world distances for the soft shadows.
+const LIGHT_EXTENT = 10, LIGHT_NEAR = 1, LIGHT_FAR = 45;
+const EXPOSURE = 0.8;
+
 const MAIN_VS = `#version 300 es
 layout(location=0) in vec3 a_pos;
 layout(location=1) in vec3 a_nrm;
 layout(location=2) in vec4 a_aux;   // xyz: per-piece grain offset, w: tone variation
 uniform mat4 u_model, u_vp, u_lightVP;
-out vec3 v_world, v_nrm, v_local;
+out vec3 v_world, v_nrm, v_local, v_tan;
 out vec4 v_aux, v_sh;
 void main() {
   vec4 w = u_model * vec4(a_pos, 1.0);
   v_world = w.xyz;
   v_nrm = mat3(u_model) * a_nrm;    // model matrices are rotation + uniform scale only
+  v_tan = mat3(u_model) * vec3(1.0, 0.0, 0.0);   // wood fibres run along local X
   v_local = a_pos;
   v_aux = a_aux;
   v_sh = u_lightVP * w;
@@ -461,13 +476,23 @@ void main() {
 const MAIN_FS = `#version 300 es
 precision highp float;
 precision highp sampler2DShadow;
-in vec3 v_world, v_nrm, v_local;
+in vec3 v_world, v_nrm, v_local, v_tan;
 in vec4 v_aux, v_sh;
 uniform vec3 u_color, u_seed, u_highlight, u_lightDir, u_eye, u_bg;
-uniform int u_mode;          // 0 = wood, 1 = translucent overlay, 2 = ground
-uniform float u_alpha, u_texel;
+uniform vec4 u_blob;         // contact shadow: core half-size (x, z), corner radius, fade width
+uniform int u_mode;          // 0 = wood, 1 = translucent overlay, 2 = cloth ground, 3 = contact shadow
+uniform float u_alpha, u_texel, u_ao;
 uniform sampler2DShadow u_shadow;
+uniform sampler2D u_depth;   // the same shadow map read as raw depth (PCSS blocker search)
 out vec4 o;
+
+const float PI = 3.14159265;
+const float TILE_H = ${TILE_H.toFixed(4)}, TILE_HALF = ${(TILE / 2).toFixed(4)};
+const vec2 SLAB_HALF = vec2(${SLAB_X.toFixed(3)}, ${SLAB_Z.toFixed(3)});
+const float LIGHT_RANGE = ${(LIGHT_FAR - LIGHT_NEAR).toFixed(1)};      // world units over depth [0,1]
+const float LIGHT_SOFT = ${(0.05 / (2 * LIGHT_EXTENT)).toFixed(5)};   // penumbra (shadow-map uv) per world unit of gap
+const float CLOTH_PITCH = 0.07;                                        // thread spacing
+const float EXPOSURE = ${EXPOSURE.toFixed(3)};
 
 // Cheap hash-based 3D value noise (no textures needed).
 float hash(vec3 p) {
@@ -488,52 +513,174 @@ float noise(vec3 x) {
 // parallel to local X. The axis sits far from the piece (via the offsets),
 // so on flat faces the rings read as gently curving stripes, like flat-sawn
 // boards. Low-frequency noise warps the rings; stretched noise adds fibres.
-vec3 wood(vec3 p) {
+// Also returns the ring band and fibre values, which drive the varnish.
+vec3 wood(vec3 p, out float band, out float fibre) {
   vec3 q = p + u_seed + v_aux.xyz;
   float w1 = noise(q * vec3(0.5, 2.0, 2.0));
   float w2 = noise(q * vec3(1.1, 5.0, 5.0));
   float r = length(q.yz) * 7.0 + w1 * 2.5 + w2 * 0.6;
   float ring = fract(r);
-  float band = smoothstep(0.0, 0.18, ring) - smoothstep(0.45, 1.0, ring);
-  float fibre = noise(q * vec3(2.0, 26.0, 26.0));
+  band = smoothstep(0.0, 0.18, ring) - smoothstep(0.45, 1.0, ring);
+  fibre = noise(q * vec3(2.0, 26.0, 26.0));
   float shade = 0.87 + 0.09 * band - 0.05 * fibre + 0.08 * (w1 - 0.5) + 0.06 * v_aux.w;
   return u_color * shade;
 }
 
-// 4-tap PCF on top of the hardware 2x2 comparison filter.
+// Sample k of n on a Vogel (golden-angle) spiral filling the unit disc.
+vec2 vogel(int k, float n) {
+  float r = sqrt((float(k) + 0.5) / n), a = float(k) * 2.39996323;
+  return r * vec2(cos(a), sin(a));
+}
+
+// Percentage-closer soft shadows. First average the depth of the occluders
+// around this point, then widen the PCF kernel in proportion to the gap
+// between occluder and receiver, so shadows are crisp where a piece touches
+// the board and soften with height. The light is orthographic, so a depth
+// difference maps linearly to a world distance.
 float shadowAt() {
   vec3 p = v_sh.xyz / v_sh.w * 0.5 + 0.5;
   if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0 || p.z > 1.0) return 1.0;
-  float z = p.z - 0.0012, t = u_texel * 0.9;
-  return 0.25 * (texture(u_shadow, vec3(p.xy + vec2(-t, -t), z)) +
-                 texture(u_shadow, vec3(p.xy + vec2( t, -t), z)) +
-                 texture(u_shadow, vec3(p.xy + vec2(-t,  t), z)) +
-                 texture(u_shadow, vec3(p.xy + vec2( t,  t), z)));
+  float z = p.z - 0.0012;
+  // Rotate the pattern per pixel (interleaved gradient noise): fine grain
+  // instead of visible banding.
+  float a = 6.2831853 * fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+  mat2 R = mat2(cos(a), sin(a), -sin(a), cos(a));
+  float sum = 0.0, cnt = 0.0;
+  for (int k = 0; k < 8; k++) {
+    float d = texture(u_depth, p.xy + R * vogel(k, 8.0) * (u_texel * 14.0)).r;
+    if (d < z) { sum += d; cnt += 1.0; }
+  }
+  if (cnt == 0.0) return 1.0;
+  float gap = (z - sum / cnt) * LIGHT_RANGE;
+  float radius = clamp(gap * LIGHT_SOFT, 1.2 * u_texel, 14.0 * u_texel);
+  float s = 0.0;
+  for (int k = 0; k < 16; k++) s += texture(u_shadow, vec3(p.xy + R * vogel(k, 16.0) * radius, z));
+  return s / 16.0;
+}
+
+// Ambient occlusion of the grooves, computed analytically from the fixed
+// tile grid rather than by sampling the scene. A wall of height H at
+// horizontal distance d hides a cosine-weighted fraction
+// 0.5 * (1 - d / sqrt(d^2 + H^2)) of the sky (2D cross-section).
+float wallBlock(float d) { return 0.5 * (1.0 - d * inversesqrt(d * d + TILE_H * TILE_H)); }
+// Sky visible from slab point x, looking along one axis ('other' is the
+// coordinate on the perpendicular axis).
+float axisOpen(float x, float other) {
+  float c = clamp(round(x), -4.0, 4.0), off = x - c, a = abs(off) - TILE_HALF;
+  if (a < 0.0) return 1.0;                        // within the tile's span: no wall faces this way
+  float v = 1.0 - wallBlock(a);
+  if (abs(c + sign(off)) <= 4.0) v -= wallBlock(1.0 - 2.0 * TILE_HALF - a);   // wall across the groove
+  // The walls only run alongside tiles: weaker at groove crossings, none past the board.
+  float span = abs(other - clamp(round(other), -4.0, 4.0));
+  float w = (1.0 - 0.6 * smoothstep(TILE_HALF, 0.5, span)) * (1.0 - smoothstep(0.5, 0.7, span));
+  return mix(1.0, v, w);
+}
+float boardAO(vec3 p, vec3 N) {
+  if (N.y > 0.7 && p.y < 0.01) return axisOpen(p.x, p.z) * axisOpen(p.z, p.x);
+  // Tile side walls darken towards the groove floor.
+  if (abs(N.y) < 0.7 && p.y < TILE_H && p.y > -0.01 && max(abs(p.x), abs(p.z)) < 4.5)
+    return mix(0.6, 1.0, smoothstep(-0.01, TILE_H, p.y));
+  return 1.0;
+}
+
+// Woven tablecloth: a plain weave where warp threads (along x) and weft
+// threads (along z) alternate over and under at every crossing. Each visible
+// thread segment is shaded as a rounded strand that dips at both ends. The
+// detail fades to its average once threads shrink towards pixel size, which
+// keeps distant cloth from shimmering.
+vec3 cloth(out vec3 N, out float occl) {
+  vec2 q = v_world.xz / CLOTH_PITCH;
+  vec2 cell = floor(q), f = fract(q) - 0.5;
+  bool warpTop = mod(cell.x + cell.y, 2.0) < 0.5;
+  vec2 af = warpTop ? f.yx : f;                  // x: across the top thread, y: along it
+  float h = sqrt(max(1.0 - 4.0 * af.x * af.x, 0.0)) * (0.65 + 0.35 * cos(af.y * 2.0 * PI));
+  vec2 fw = fwidth(q);
+  float detail = 1.0 - smoothstep(0.3, 0.8, max(fw.x, fw.y));
+  vec2 tilt = vec2(af.x * 1.4, af.y * 0.6) * detail;   // slope -> normal tilt (across, along)
+  tilt = warpTop ? tilt.yx : tilt;                      // back to world (x, z)
+  N = normalize(vec3(tilt.x, 1.0, tilt.y));
+  occl = mix(0.8, mix(0.5, 1.0, h), detail);
+  // Thread-to-thread dye variation, fibre streaks along each thread, and broad mottling.
+  float thread = warpTop ? cell.y : cell.x;
+  float tone = hash(vec3(thread, warpTop ? 1.0 : 2.0, 3.7)) - 0.5;
+  vec3 fq = warpTop ? vec3(v_world.x * 6.0, v_world.z * 40.0, 1.0) : vec3(v_world.z * 6.0, v_world.x * 40.0, 5.0);
+  float fib = noise(fq);
+  float mott = noise(v_world * vec3(0.6, 0.0, 0.6) + 11.0);
+  return u_color * (1.0 + (0.12 * tone + 0.14 * (fib - 0.5)) * detail + 0.14 * (mott - 0.5));
+}
+
+vec3 ambient(vec3 N) { return mix(vec3(0.36, 0.33, 0.31), vec3(0.54, 0.55, 0.58), N.y * 0.5 + 0.5); }
+
+// Filmic tone curve (Narkowicz's ACES fit): rolls bright areas off smoothly
+// instead of clipping them.
+vec3 tonemap(vec3 x) {
+  x *= EXPOSURE;
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
 }
 
 void main() {
   vec3 N = normalize(v_nrm), L = u_lightDir;
-  float ndl = max(dot(N, L), 0.0);
   if (u_mode == 1) {
-    vec3 c = u_color * (0.6 + 0.4 * ndl);
+    vec3 c = u_color * (0.6 + 0.4 * max(dot(N, L), 0.0));
     o = vec4(pow(c, vec3(1.0 / 2.2)), u_alpha);
     return;
   }
-  vec3 albedo = u_mode == 0 ? wood(v_local) : u_color;
-  float sh = shadowAt();
-  vec3 V = normalize(u_eye - v_world), H = normalize(L + V);
-  float spec = pow(max(dot(N, H), 0.0), 48.0) * (u_mode == 0 ? 0.16 : 0.02);
-  // Soft lighting: strong ambient, gentler sun, and shadows that only
-  // remove part of the direct light, so dark and shadowed areas stay close.
-  vec3 amb = mix(vec3(0.36, 0.33, 0.31), vec3(0.54, 0.55, 0.58), N.y * 0.5 + 0.5);
-  vec3 col = albedo * (amb + vec3(1.0, 0.95, 0.87) * 1.05 * ndl * mix(0.45, 1.0, sh)) + spec * sh + u_highlight;
-  if (u_mode == 2) {
-    // Floor: a warm pool of light under the board fading out to the background.
-    float d = length(v_world.xz);
-    col *= 1.0 + 0.7 * (1.0 - smoothstep(0.0, 15.0, d));
-    col = mix(col, u_bg, smoothstep(9.0, 28.0, d));
+  if (u_mode == 3) {
+    // Soft contact shadow: rounded-rectangle distance, fading out over u_blob.w.
+    vec2 q = abs(v_local.xz) - u_blob.xy + u_blob.z;
+    float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - u_blob.z;
+    float t = 1.0 - clamp(d / u_blob.w, 0.0, 1.0);
+    o = vec4(0.0, 0.0, 0.0, u_alpha * t * t);
+    return;
   }
-  o = vec4(pow(col, vec3(1.0 / 2.2)), 1.0);
+  vec3 V = normalize(u_eye - v_world);
+  float sh = shadowAt();
+  vec3 sun = vec3(1.0, 0.95, 0.87) * 1.1;
+  vec3 col;
+  if (u_mode == 2) {
+    float occl;
+    vec3 albedo = cloth(N, occl);
+    float ndl = max(dot(N, L), 0.0), ndv = max(dot(N, V), 0.0);
+    // Darken the cloth right around the foot of the board.
+    vec2 dq = abs(v_world.xz) - SLAB_HALF;
+    float ds = length(max(dq, 0.0)) + min(max(dq.x, dq.y), 0.0);
+    float gao = mix(0.4, 1.0, smoothstep(0.0, 0.9, ds));
+    vec3 amb = ambient(N) * gao;
+    col = albedo * occl * (amb + sun * ndl * mix(0.45, 1.0, sh));
+    col += amb * occl * 0.12 * pow(1.0 - ndv, 4.0);   // fabric sheen at grazing angles
+    // A warm pool of light under the board fading out to the background.
+    float d = length(v_world.xz);
+    col *= 1.0 + 0.7 * (1.0 - smoothstep(0.0, 16.0, d));
+    col = mix(col, u_bg, smoothstep(10.0, 30.0, d));
+  } else {
+    float band, fibre;
+    vec3 albedo = wood(v_local, band, fibre);
+    float ao = u_ao > 0.5 ? boardAO(v_world, N) : 1.0;
+    float ndl = max(dot(N, L), 0.0), ndv = max(dot(N, V), 1e-4);
+    vec3 H = normalize(L + V);
+    float ndh = max(dot(N, H), 0.0);
+    // Soft lighting: strong ambient, gentler sun, and shadows that only
+    // remove part of the direct light, so dark and shadowed areas stay close.
+    float lit = ndl * mix(0.45, 1.0, sh);
+    col = albedo * (ambient(N) * ao + sun * lit);
+    // Sheen of the wood under the varnish: an anisotropic (Kajiya-Kay)
+    // highlight stretched across the fibres, flickering with the fibre noise.
+    // On end-grain faces the fibre axis is parallel to N and it fades out.
+    vec3 T = v_tan - N * dot(v_tan, N);
+    float tl = length(T), th = dot(T / max(tl, 1e-4), H);
+    col += albedo * sun * lit * 0.3 * pow(max(1.0 - th * th, 0.0), 40.0) * (0.4 + fibre) * smoothstep(0.2, 0.6, tl);
+    // Varnish: a clear coat with Schlick Fresnel, glossier on the dense ring
+    // bands and slightly duller where the fibres are open.
+    float gloss = mix(70.0, 160.0, band) * (1.1 - 0.3 * fibre);
+    float Fh = 0.04 + 0.96 * pow(1.0 - max(dot(V, H), 0.0), 5.0);
+    col += sun * lit * Fh * pow(ndh, gloss) * (gloss + 8.0) / 25.0;
+    // ...plus a faint reflection of the room, which grows at grazing angles.
+    vec3 R = reflect(-V, N);
+    vec3 env = mix(vec3(0.05, 0.045, 0.04), vec3(0.7, 0.69, 0.67), smoothstep(-0.1, 0.7, R.y));
+    col += env * (0.04 + 0.96 * pow(1.0 - ndv, 5.0)) * ao * 0.6;
+  }
+  col += u_highlight;
+  o = vec4(pow(tonemap(col), vec3(1.0 / 2.2)), 1.0);
 }`;
 
 const SHADOW_VS = `#version 300 es
@@ -570,34 +717,67 @@ class MeshBuilder {
   constructor() { this.v = []; this.idx = []; this.n = 0; }
   vert(p, nr, aux) { this.v.push(p[0], p[1], p[2], nr[0], nr[1], nr[2], aux[0], aux[1], aux[2], aux[3]); return this.n++; }
   quad(a, b, c, d) { this.idx.push(a, b, c, a, c, d); }
-  // Axis-aligned box centred at (cx,cy,cz) with full sizes (sx,sy,sz).
-  box(cx, cy, cz, sx, sy, sz, aux = [0, 0, 0, 0]) {
-    const h = [sx / 2, sy / 2, sz / 2];
+  // Axis-aligned box centred at (cx,cy,cz) with full sizes (sx,sy,sz) and its
+  // edges rounded to radius `bev`. Each face is a grid whose outer rows fall
+  // inside the bevel band; every grid point is then pushed onto the rounded
+  // surface by measuring it from the inner core box (the box shrunk by bev),
+  // as in a rounded-box SDF. Neighboring faces generate identical points
+  // along their shared edge, so the surface is seamless with smooth normals.
+  box(cx, cy, cz, sx, sy, sz, bev, aux = [0, 0, 0, 0]) {
+    const h = [sx / 2, sy / 2, sz / 2], core = h.map(v => v - bev), K = 3;
+    const ticks = a => {
+      const t = [];
+      for (let s = 0; s <= K; s++) t.push(-h[a] + bev * s / K);
+      for (let s = K; s >= 0; s--) t.push(h[a] - bev * s / K);
+      return t;
+    };
     for (const [a, u, w] of [[0, 1, 2], [1, 2, 0], [2, 0, 1]]) for (const sg of [1, -1]) {
-      const nr = [0, 0, 0]; nr[a] = sg;
-      const ids = [];
-      for (const [su, sw] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
-        const p = [cx, cy, cz];
-        p[a] += sg * h[a]; p[u] += su * h[u]; p[w] += sw * h[w];
-        ids.push(this.vert(p, nr, aux));
+      const tu = ticks(u), tw = ticks(w), base = this.n;
+      for (const pu of tu) for (const pw of tw) {
+        const p = [0, 0, 0]; p[a] = sg * h[a]; p[u] = pu; p[w] = pw;
+        const c = p.map((v, k) => clamp(v, -core[k], core[k]));
+        const nr = norm(sub(p, c));
+        this.vert([cx + c[0] + bev * nr[0], cy + c[1] + bev * nr[1], cz + c[2] + bev * nr[2]], nr, aux);
       }
-      this.quad(...ids);
+      const n = tw.length;
+      for (let i = 0; i < tu.length - 1; i++) for (let j = 0; j < n - 1; j++) {
+        const q = base + i * n + j;
+        this.quad(q, q + n, q + n + 1, q + 1);
+      }
     }
   }
-  // Surface of revolution around Y from a [radius, y] profile (flat-shaded per segment).
-  lathe(profile, segs, aux = [0, 0, 0, 0]) {
+  // Surface of revolution around Y from a [radius, y] profile. Normals are
+  // smoothed across profile corners gentler than the crease threshold (cosine
+  // of the angle between segment normals) and kept sharp elsewhere.
+  lathe(profile, segs, aux = [0, 0, 0, 0], crease = 0.75) {
+    const sn = [];
     for (let k = 0; k < profile.length - 1; k++) {
       const [r0, y0] = profile[k], [r1, y1] = profile[k + 1];
-      let nr = y1 - y0, ny = -(r1 - r0);
-      const l = Math.hypot(nr, ny); nr /= l; ny /= l;
+      const l = Math.hypot(y1 - y0, r1 - r0);
+      sn.push([(y1 - y0) / l, -(r1 - r0) / l]);
+    }
+    // Normal at profile point k as seen from segment s (one of the two segments meeting there).
+    const vn = (k, s) => {
+      const a = sn[s], b = sn[s === k ? k - 1 : k];
+      if (!b || a[0] * b[0] + a[1] * b[1] < crease) return a;
+      const l = Math.hypot(a[0] + b[0], a[1] + b[1]);
+      return [(a[0] + b[0]) / l, (a[1] + b[1]) / l];
+    };
+    for (let k = 0; k < sn.length; k++) {
+      const [r0, y0] = profile[k], [r1, y1] = profile[k + 1], n0 = vn(k, k), n1 = vn(k + 1, k);
       const base = this.n;
       for (let s = 0; s <= segs; s++) {
         const a = s / segs * Math.PI * 2, ca = Math.cos(a), sa = Math.sin(a);
-        this.vert([r0 * ca, y0, r0 * sa], [nr * ca, ny, nr * sa], aux);
-        this.vert([r1 * ca, y1, r1 * sa], [nr * ca, ny, nr * sa], aux);
+        this.vert([r0 * ca, y0, r0 * sa], [n0[0] * ca, n0[1], n0[0] * sa], aux);
+        this.vert([r1 * ca, y1, r1 * sa], [n1[0] * ca, n1[1], n1[0] * sa], aux);
       }
       for (let s = 0; s < segs; s++) { const i = base + s * 2; this.quad(i, i + 2, i + 3, i + 1); }
     }
+  }
+  // Flat rectangle facing up at y = 0 (used for contact shadows).
+  plane(hx, hz) {
+    const ids = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([a, b]) => this.vert([a * hx, 0, b * hz], [0, 1, 0], [0, 0, 0, 0]));
+    this.quad(...ids);
   }
   sphere(cx, cy, cz, R, lat, lon, aux = [0, 0, 0, 0]) {
     const base = this.n;
@@ -646,28 +826,39 @@ const rand = () => ((seedState = (seedState * 1103515245 + 12345) >>> 0) / 42949
 const meshes = {};
 {
   let b = new MeshBuilder();
-  b.box(0, -SLAB_H / 2, 0, SLAB_X * 2, SLAB_H, SLAB_Z * 2, [3.1, 6.3, 11.7, 0]);
+  b.box(0, -SLAB_H / 2, 0, SLAB_X * 2, SLAB_H, SLAB_Z * 2, 0.06, [3.1, 6.3, 11.7, 0]);
   meshes.slab = b.upload();
 
   // All 81 squares in one mesh; each gets its own grain offset and tone.
+  // They extend TILE_BEV below the slab top so the rounded bottom edge is buried.
   b = new MeshBuilder();
   for (let r = 0; r < 9; r++) for (let c = 0; c < 9; c++)
-    b.box(cellX(c), TILE_H / 2, cellZ(r), TILE, TILE_H, TILE,
+    b.box(cellX(c), (TILE_H - TILE_BEV) / 2, cellZ(r), TILE, TILE_H + TILE_BEV, TILE, TILE_BEV,
       [rand() * 40 - 20, 6 + rand() * 8, 6 + rand() * 8, rand() - 0.5]);
   meshes.tiles = b.upload();
 
   b = new MeshBuilder();
-  b.box(0, FENCE_H / 2, 0, FENCE_LEN, FENCE_H, FENCE_T);   // long axis = local X
+  b.box(0, FENCE_H / 2, 0, FENCE_LEN, FENCE_H, FENCE_T, 0.03);   // long axis = local X
   meshes.fence = b.upload();
 
-  // Pawn: truncated cone body on a small plinth, sphere head.
+  // Pawn: a turned-wood piece. Rounded plinth with a small cove, gently
+  // swelling cone body, a collar under the head, and a sphere head.
+  const pawnProfile = [[0, 0], [0.29, 0], [0.305, 0.006], [0.315, 0.02], [0.318, 0.035], [0.312, 0.05],
+    [0.295, 0.062], [0.27, 0.068], [0.258, 0.08]];
+  for (let k = 0; k <= 10; k++) {
+    const t = k / 10;
+    pawnProfile.push([lerp(0.25, 0.135, t) + 0.02 * Math.sin(Math.PI * t), 0.09 + 0.51 * t]);
+  }
+  pawnProfile.push([0.16, 0.615], [0.172, 0.632], [0.172, 0.648], [0.158, 0.663], [0.11, 0.672], [0, 0.672]);
   b = new MeshBuilder();
-  b.lathe([[0, 0], [0.31, 0], [0.31, 0.05], [0.28, 0.08], [0.13, 0.64], [0.0, 0.64]], 48);
+  b.lathe(pawnProfile, 48);
   b.sphere(0, 0.82, 0, 0.2, 24, 48);
   meshes.pawn = b.upload();
 
   b = new MeshBuilder(); b.ring(0.36, 0.43, 48); meshes.ring = b.upload();
   b = new MeshBuilder(); b.ring(0, 0.13, 32); meshes.dot = b.upload();
+  b = new MeshBuilder(); b.plane(0.8, 0.8); meshes.pawnBlob = b.upload();
+  b = new MeshBuilder(); b.plane(1.45, 0.6); meshes.fenceBlob = b.upload();
 
   b = new MeshBuilder();
   b.v.push(-60, -SLAB_H, -60, 0, 1, 0, 0, 0, 0, 0, 60, -SLAB_H, -60, 0, 1, 0, 0, 0, 0, 0,
@@ -681,12 +872,20 @@ const SM = 2048;
 const shadowTex = gl.createTexture();
 gl.bindTexture(gl.TEXTURE_2D, shadowTex);
 gl.texStorage2D(gl.TEXTURE_2D, 1, gl.DEPTH_COMPONENT24, SM, SM);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_MODE, gl.COMPARE_REF_TO_TEXTURE);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_FUNC, gl.LEQUAL);
+// The shadow map is read two ways: with hardware depth comparison (PCF) and
+// as raw depth (the PCSS blocker search). Sampler objects let the one
+// texture sit on two units with different filter/compare state.
+const makeSampler = (filter, compare) => {
+  const s = gl.createSampler();
+  gl.samplerParameteri(s, gl.TEXTURE_MIN_FILTER, filter);
+  gl.samplerParameteri(s, gl.TEXTURE_MAG_FILTER, filter);
+  gl.samplerParameteri(s, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.samplerParameteri(s, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.samplerParameteri(s, gl.TEXTURE_COMPARE_MODE, compare ? gl.COMPARE_REF_TO_TEXTURE : gl.NONE);
+  gl.samplerParameteri(s, gl.TEXTURE_COMPARE_FUNC, gl.LEQUAL);
+  return s;
+};
+const cmpSampler = makeSampler(gl.LINEAR, true), rawSampler = makeSampler(gl.NEAREST, false);
 const shadowFB = gl.createFramebuffer();
 gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFB);
 gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, shadowTex, 0);
@@ -695,7 +894,7 @@ gl.readBuffer(gl.NONE);
 gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
 const LIGHT_DIR = norm([-0.45, 1.0, 0.6]);     // direction towards the light
-const lightVP = mat4Mul(ortho(-10, 10, -10, 10, 1, 45),
+const lightVP = mat4Mul(ortho(-LIGHT_EXTENT, LIGHT_EXTENT, -LIGHT_EXTENT, LIGHT_EXTENT, LIGHT_NEAR, LIGHT_FAR),
   lookAt([LIGHT_DIR[0] * 22, LIGHT_DIR[1] * 22, LIGHT_DIR[2] * 22], [0, 0, 0], [0, 1, 0]));
 
 /* =====================================================================
@@ -757,7 +956,7 @@ function setView(p, instant = false) {
  * Rendering
  * ===================================================================== */
 let lastVP = null, lastEye = [0, 0, 0];
-const dpr = () => Math.min(window.devicePixelRatio || 1, 1.5);   // cap for older GPUs
+const dpr = () => Math.min(window.devicePixelRatio || 1, 2);     // cap for very dense screens
 
 function setObjUniforms(u, color, seed, hl) {
   gl.uniform3fv(u.u_color, color);
@@ -772,13 +971,14 @@ function drawMesh(mesh) {
 function pawnColor(p) { return hexToLinear(PAWN_COLORS[p === 0 ? settings.colorA : settings.colorB][1]); }
 
 // Every opaque wooden object for this frame.
+const fenceSelected = idx => sel && sel.type === 'fence' && sel.idx === idx;
 function sceneObjects() {
   const objs = [
-    { mesh: meshes.slab, model: IDENTITY, color: COL.slab },
-    { mesh: meshes.tiles, model: IDENTITY, color: COL.tile },
+    { mesh: meshes.slab, model: IDENTITY, color: COL.slab, ao: 1 },
+    { mesh: meshes.tiles, model: IDENTITY, color: COL.tile, ao: 1 },
   ];
   vis.fences.forEach((f, idx) => {
-    const selected = sel && sel.type === 'fence' && sel.idx === idx;
+    const selected = fenceSelected(idx);
     const hovered = hover && hover.type === 'fence' && hover.idx === idx;
     objs.push({ mesh: meshes.fence, model: modelMat(f.x, f.y + (selected ? 0.18 : 0), f.z, f.rot), color: COL.fence, seed: f.seed,
       hl: selected ? [0.11, 0.09, 0.05] : hovered ? [0.05, 0.05, 0.03] : null });
@@ -790,6 +990,23 @@ function sceneObjects() {
       hl: selected ? [0.11, 0.09, 0.05] : hovered ? [0.05, 0.05, 0.03] : null });
   });
   return objs;
+}
+
+// Soft contact shadows under every pawn and fence: [mesh, model, blob params, alpha].
+// They spread and fade as the piece lifts off the board.
+function contactShadows() {
+  const out = [];
+  for (const pw of vis.pawns) {
+    const lift = pw.y - TILE_H;
+    out.push([meshes.pawnBlob, modelMat(pw.x, TILE_H + 0.003, pw.z), [0.31, 0.31, 0.31, 0.16 + lift * 0.4],
+      0.5 * clamp(1 - lift / 0.8, 0, 1)]);
+  }
+  vis.fences.forEach((f, idx) => {
+    const lift = f.y + (fenceSelected(idx) ? 0.18 : 0);
+    out.push([meshes.fenceBlob, modelMat(f.x, 0.003, f.z, f.rot), [FENCE_LEN / 2, FENCE_T / 2, 0.03, 0.13 + lift * 0.4],
+      0.45 * clamp(1 - lift / 0.8, 0, 1)]);
+  });
+  return out;
 }
 
 // Translucent overlays: [mesh, model, color, alpha].
@@ -844,7 +1061,7 @@ function draw(now) {
   // Pass 2: the scene.
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   gl.viewport(0, 0, W, H);
-  const bg = COL.bg.map(v => Math.pow(v, 1 / 2.2));
+  const bg = displayColor(COL.bg);
   gl.clearColor(bg[0], bg[1], bg[2], 1);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
   const u = mainP.u;
@@ -858,9 +1075,15 @@ function draw(now) {
   gl.uniform1f(u.u_alpha, 1);
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, shadowTex);
+  gl.bindSampler(0, cmpSampler);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, shadowTex);
+  gl.bindSampler(1, rawSampler);
   gl.uniform1i(u.u_shadow, 0);
+  gl.uniform1i(u.u_depth, 1);
 
   gl.uniform1i(u.u_mode, 2);
+  gl.uniform1f(u.u_ao, 0);
   gl.uniformMatrix4fv(u.u_model, false, IDENTITY);
   setObjUniforms(u, COL.ground);
   drawMesh(meshes.ground);
@@ -868,16 +1091,22 @@ function draw(now) {
   gl.uniform1i(u.u_mode, 0);
   for (const o of objs) {
     gl.uniformMatrix4fv(u.u_model, false, o.model);
+    gl.uniform1f(u.u_ao, o.ao || 0);
     setObjUniforms(u, o.color, o.seed, o.hl);
     drawMesh(o.mesh);
   }
 
-  // Pass 3: translucent overlays.
-  const { decals, ghosts } = overlayList(now);
-  gl.uniform1i(u.u_mode, 1);
+  // Pass 3: translucent overlays, starting with the contact shadows.
   gl.enable(gl.BLEND);
   gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
   gl.depthMask(false);
+  gl.uniform1i(u.u_mode, 3);
+  for (const [mesh, model, blob, alpha] of contactShadows()) {
+    if (alpha <= 0) continue;
+    gl.uniformMatrix4fv(u.u_model, false, model); gl.uniform4fv(u.u_blob, blob); gl.uniform1f(u.u_alpha, alpha); drawMesh(mesh);
+  }
+  const { decals, ghosts } = overlayList(now);
+  gl.uniform1i(u.u_mode, 1);
   for (const [mesh, model, color, alpha] of decals) {
     gl.uniformMatrix4fv(u.u_model, false, model); setObjUniforms(u, color); gl.uniform1f(u.u_alpha, alpha); drawMesh(mesh);
   }
