@@ -417,8 +417,10 @@ const FENCE_LEN = 1.82, FENCE_H = 0.4, FENCE_T = 0.13;
 const SLAB_X = 5.2, SLAB_Z = 7.6, SLAB_H = 0.4;
 const STORE_Z = 6.25;                              // unused fence rows
 const ANIM_MS = 360;                               // move animation (must be <= 400)
-const FOV = 45 * Math.PI / 180;
-const LENS_SHIFT = 0.22;                           // NDC; lifts the image so the near-heavy board looks centred
+// Fixed focal length in CSS px, so a smaller window narrows the FOV.
+const FOCAL_PX = 1800;
+const FOV_MIN = 20 * Math.PI / 180, FOV_MAX = 60 * Math.PI / 180;
+const FILL_H = 0.94, FILL_V = 0.69;                // default view: half-extent of the board in NDC, max
 const cellX = c => c - 4;
 const cellZ = r => 4 - r;                          // row A nearest to player A's camera (+z)
 
@@ -933,22 +935,63 @@ resetVisuals();
  * Camera: orbit around a target point on the board
  * ===================================================================== */
 const DEFAULT_PITCH = 0.6;
-const cam = { yaw: 0, pitch: DEFAULT_PITCH, dist: 17, tx: 0, tz: 0 };
+const cam = { yaw: 0, pitch: DEFAULT_PITCH, dist: 17, tx: 0, tz: 0, shift: 0 };   // shift: lens shift in NDC
 let camAnim = null;
 function camEye() {
   const cp = Math.cos(cam.pitch);
   return [cam.tx + cam.dist * Math.sin(cam.yaw) * cp, cam.dist * Math.sin(cam.pitch), cam.tz + cam.dist * Math.cos(cam.yaw) * cp];
 }
-function fitDist() {
-  const aspect = canvas.clientWidth / Math.max(1, canvas.clientHeight);
-  const hHalf = Math.atan(Math.tan(FOV / 2) * aspect);
-  return Math.max(18, 5.8 / Math.tan(hHalf) + 4);
+function camFov() {
+  return clamp(2 * Math.atan(canvas.clientHeight / 2 / FOCAL_PX), FOV_MIN, FOV_MAX);
+}
+
+// Points that must stay in frame: slab corners and the tips of the stored fences.
+const FRAME_PTS = [];
+for (const x of [-SLAB_X, SLAB_X]) for (const z of [-SLAB_Z, SLAB_Z]) FRAME_PTS.push([x, 0, z], [x, -SLAB_H, z]);
+for (const x of [-1, 1]) for (const z of [-1, 1]) for (const e of [-1, 1])
+  FRAME_PTS.push([x * Math.abs(storePos(0, 0).x), FENCE_H, z * (STORE_Z + e * FENCE_LEN / 2)]);
+
+// NDC extents of FRAME_PTS from the default view (target at board centre, no shift). The board is
+// symmetric under a half turn, so this holds for both players' sides.
+function frameExtents(dist, fov, aspect) {
+  const sp = Math.sin(DEFAULT_PITCH), cp = Math.cos(DEFAULT_PITCH), t = Math.tan(fov / 2);
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  for (const [x, y, z] of FRAME_PTS) {
+    const ry = y - dist * sp, rz = z - dist * cp, depth = -ry * sp - rz * cp;
+    if (depth < 0.1) return { x0: -Infinity, x1: Infinity, y0: -Infinity, y1: Infinity };
+    const nx = x / (depth * t * aspect), ny = (ry * cp - rz * sp) / (depth * t);
+    x0 = Math.min(x0, nx); x1 = Math.max(x1, nx); y0 = Math.min(y0, ny); y1 = Math.max(y1, ny);
+  }
+  return { x0, x1, y0, y1 };
+}
+
+// Default framing for the current canvas size: the closest distance at which the board fits within
+// FILL_H / FILL_V, and the lens shift that centres it vertically (perspective enlarges the near half,
+// so without it the board sits low).
+let camFit = null;
+function updateFit() {
+  const w = canvas.clientWidth, h = Math.max(1, canvas.clientHeight);
+  if (camFit && camFit.w === w && camFit.h === h) return camFit;
+  const fov = camFov(), aspect = w / h;
+  let lo = 1, hi = 400;
+  for (let i = 0; i < 40; i++) {
+    const mid = (lo + hi) / 2, f = frameExtents(mid, fov, aspect);
+    if ((f.x1 - f.x0) / 2 > FILL_H || (f.y1 - f.y0) / 2 > FILL_V) lo = mid; else hi = mid;
+  }
+  const f = frameExtents(hi, fov, aspect), fit = { w, h, dist: hi, shift: -(f.y0 + f.y1) / 2 };
+  // Window resized: keep the user's relative zoom and take the new lens shift.
+  if (camFit) {
+    const k = fit.dist / camFit.dist;
+    for (const c of camAnim ? [cam, camAnim.from, camAnim.to] : [cam]) { c.dist *= k; c.shift = fit.shift; }
+  }
+  return (camFit = fit);
 }
 // Smoothly move the camera to player p's side (p=0: A's rows nearest).
 function setView(p, instant = false) {
   let yaw = p === 0 ? 0 : Math.PI;
   yaw += Math.round((cam.yaw - yaw) / (2 * Math.PI)) * 2 * Math.PI;   // shortest way round
-  const to = { yaw, pitch: DEFAULT_PITCH, dist: fitDist(), tx: 0, tz: 0 };
+  const fit = updateFit();
+  const to = { yaw, pitch: DEFAULT_PITCH, dist: fit.dist, tx: 0, tz: 0, shift: fit.shift };
   if (instant) { Object.assign(cam, to); camAnim = null; requestRender(); return; }
   camAnim = { from: { ...cam }, to, t0: performance.now(), dur: 550 };
   requestRender();
@@ -1040,9 +1083,10 @@ function resize() {
 
 function draw(now) {
   resize();
+  updateFit();
   const W = canvas.width, H = canvas.height;
   const eye = camEye();
-  const vp = mat4Mul(perspective(FOV, W / H, 0.3, 120, LENS_SHIFT), lookAt(eye, [cam.tx, 0, cam.tz], [0, 1, 0]));
+  const vp = mat4Mul(perspective(camFov(), W / H, 0.3, 120, cam.shift), lookAt(eye, [cam.tx, 0, cam.tz], [0, 1, 0]));
   lastVP = vp; lastEye = eye;
   const objs = sceneObjects();
 
@@ -1137,6 +1181,7 @@ function updateLabels(vp) {
   labelBox.hidden = !settings.labels;
   if (!settings.labels) return;
   const w = canvas.clientWidth, h = canvas.clientHeight;
+  const focal = h / (2 * Math.tan(camFov() / 2));      // px per world unit at depth 1
   for (const l of labels) {
     const x = l.x, y = 0.01, z = l.z;
     const cx = vp[0] * x + vp[4] * y + vp[8] * z + vp[12];
@@ -1146,7 +1191,7 @@ function updateLabels(vp) {
     l.el.style.display = '';
     const sx = (cx / cw * 0.5 + 0.5) * w, sy = (0.5 - cy / cw * 0.5) * h;
     // Scale the font with perspective so distant labels shrink too.
-    const fs = clamp(300 / cw * Math.min(1, h / 700 + 0.3), 9, 24);
+    const fs = clamp(0.214 * focal / cw * Math.min(1, h / 700 + 0.3), 9, 24);
     l.el.style.fontSize = fs.toFixed(1) + 'px';
     l.el.style.transform = `translate(${sx.toFixed(1)}px, ${sy.toFixed(1)}px) translate(-50%, -50%)`;
   }
@@ -1166,7 +1211,7 @@ function frame(now) {
   }
   if (camAnim) {
     const t = clamp((now - camAnim.t0) / camAnim.dur, 0, 1), e = ease(t);
-    for (const k of ['yaw', 'pitch', 'dist', 'tx', 'tz']) cam[k] = lerp(camAnim.from[k], camAnim.to[k], e);
+    for (const k of ['yaw', 'pitch', 'dist', 'tx', 'tz', 'shift']) cam[k] = lerp(camAnim.from[k], camAnim.to[k], e);
     if (t >= 1) camAnim = null;
   }
   if (hint && now - hint.start > 400) hint = null;
@@ -1234,10 +1279,10 @@ function newGame() {
  * ===================================================================== */
 function rayFromEvent(e) {
   const rect = canvas.getBoundingClientRect();
-  const nx = ((e.clientX - rect.left) / rect.width) * 2 - 1, ny = 1 - ((e.clientY - rect.top) / rect.height) * 2 - LENS_SHIFT;
+  const nx = ((e.clientX - rect.left) / rect.width) * 2 - 1, ny = 1 - ((e.clientY - rect.top) / rect.height) * 2 - cam.shift;
   const eye = camEye(), fwd = norm(sub([cam.tx, 0, cam.tz], eye));
   const right = norm(cross(fwd, [0, 1, 0])), up = cross(right, fwd);
-  const th = Math.tan(FOV / 2), aspect = rect.width / rect.height;
+  const th = Math.tan(camFov() / 2), aspect = rect.width / rect.height;
   const d = norm([0, 1, 2].map(k => fwd[k] + right[k] * nx * th * aspect + up[k] * ny * th));
   return { o: eye, d };
 }
@@ -1340,7 +1385,7 @@ canvas.addEventListener('pointermove', e => {
   ptr.x = e.clientX; ptr.y = e.clientY;
   if (ptr.pan) {
     // Translate the orbit target across the board plane.
-    const k = cam.dist * 0.0016, s = Math.sin(cam.yaw), c = Math.cos(cam.yaw);
+    const k = cam.dist * Math.tan(camFov() / 2) * 0.0039, s = Math.sin(cam.yaw), c = Math.cos(cam.yaw);
     cam.tx = clamp(cam.tx - (c * dx + s * dy) * k, -8, 8);
     cam.tz = clamp(cam.tz - (-s * dx + c * dy) * k, -10, 10);
   } else {
@@ -1360,7 +1405,8 @@ canvas.addEventListener('contextmenu', e => e.preventDefault());
 canvas.addEventListener('wheel', e => {
   e.preventDefault();
   camAnim = null;
-  cam.dist = clamp(cam.dist * Math.exp(e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0012)), 7, 45);
+  const fd = updateFit().dist;
+  cam.dist = clamp(cam.dist * Math.exp(e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0012)), fd * 0.4, fd * 2.5);
   requestRender();
 }, { passive: false });
 window.addEventListener('resize', requestRender);
