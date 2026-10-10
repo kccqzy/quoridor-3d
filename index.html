@@ -617,7 +617,7 @@ float braid(vec2 p, out vec3 id, out vec2 sp) {
   // fibres rather than a hard ridge.
   float s = sin(PI * x), aw = a / mix(0.7, 1.0, s);
   float t = max(1.0 - 4.0 * aw * aw, 0.0);
-  float h = t * t * (3.0 - 2.0 * t) * pow(s, 0.4) * full;
+  float h = t * t * (3.0 - 2.0 * t) * pow(max(s, 0.0), 0.4) * full;
   id = vec3(col, seg, side);
   sp = vec2(x, a);
   // Twisted fibres in each strand: fine ridges along it.
@@ -703,7 +703,7 @@ void main() {
     float gao = mix(0.4, 1.0, smoothstep(0.0, 0.9, ds));
     vec3 amb = ambient(N) * gao;
     col = albedo * occl * (amb + sun * ndl * mix(0.45, 1.0, sh));
-    col += amb * occl * 0.12 * pow(1.0 - ndv, 4.0);   // fabric sheen at grazing angles
+    col += amb * occl * 0.12 * pow(max(1.0 - ndv, 0.0), 4.0);   // fabric sheen at grazing angles
     // A warm pool of light under the board fading out to the background.
     float d = length(v_world.xz);
     col *= 1.0 + 0.7 * (1.0 - smoothstep(0.0, 16.0, d));
@@ -733,7 +733,7 @@ void main() {
     // ...plus a faint reflection of the room, which grows at grazing angles.
     vec3 R = reflect(-V, N);
     vec3 env = mix(vec3(0.05, 0.045, 0.04), vec3(0.7, 0.69, 0.67), smoothstep(-0.1, 0.7, R.y));
-    col += env * (0.04 + 0.96 * pow(1.0 - ndv, 5.0)) * ao * 0.6;
+    col += env * (0.04 + 0.96 * pow(max(1.0 - ndv, 0.0), 5.0)) * ao * 0.6;
   }
   col += u_highlight;
   o = vec4(pow(tonemap(col), vec3(1.0 / 2.2)), 1.0);
