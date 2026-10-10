@@ -431,7 +431,7 @@ const PAWN_COLORS = {
 };
 const COL = {
   slab: hexToLinear('#4f321e'), tile: hexToLinear('#c39669'), fence: hexToLinear('#94552d'),
-  ground: hexToLinear('#2c4a3a'), bg: hexToLinear('#1a1d1b'),
+  ground: hexToLinear('#b3ab98'), bg: hexToLinear('#1c1a18'),
   ok: [0.15, 0.85, 0.25], bad: [0.95, 0.12, 0.1], hint: [1.0, 0.8, 0.15], ring: [1.0, 0.78, 0.35],
 };
 
@@ -495,7 +495,8 @@ const float TILE_H = ${TILE_H.toFixed(4)}, TILE_HALF = ${(TILE / 2).toFixed(4)};
 const vec2 SLAB_HALF = vec2(${SLAB_X.toFixed(3)}, ${SLAB_Z.toFixed(3)});
 const float LIGHT_RANGE = ${(LIGHT_FAR - LIGHT_NEAR).toFixed(1)};      // world units over depth [0,1]
 const float LIGHT_SOFT = ${(0.05 / (2 * LIGHT_EXTENT)).toFixed(5)};   // penumbra (shadow-map uv) per world unit of gap
-const float CLOTH_PITCH = 0.07;                                        // thread spacing
+const float BRAID_W = 0.5, BRAID_STEP = 0.3;                           // braid width, strand step along it
+const float BRAID_DEPTH = 0.02;                                      // strand relief height
 const float EXPOSURE = ${EXPOSURE.toFixed(3)};
 
 // Cheap hash-based 3D value noise (no textures needed).
@@ -587,30 +588,81 @@ float boardAO(vec3 p, vec3 N) {
   return 1.0;
 }
 
-// Woven tablecloth: a plain weave where warp threads (along x) and weft
-// threads (along z) alternate over and under at every crossing. Each visible
-// thread segment is shaded as a rounded strand that dips at both ends. The
-// detail fades to its average once threads shrink towards pixel size, which
-// keeps distant cloth from shimmering.
+// Hand-braided jute runner: parallel braids running along z, sewn side by
+// side. Seen from above, a three-strand braid shows two rows of slanted
+// strand segments meeting in a V-shaped crease down its middle, the two rows
+// offset by half a step so they interlock. Each segment is a plump, fuzzy
+// strand that dips into the centre crease and into the seam with the next
+// braid. Returns the height (0..1) and identifies the segment (braid,
+// segment, side) and the position on it (x: 0 at the crease, 1 at the seam;
+// a: across the strand).
+float braid(vec2 p, out vec3 id, out vec2 sp) {
+  // Sewn by hand: the braids curve gently and wobble a little.
+  float wander = 0.09 * (noise(vec3(p.x * 0.6, p.y * 0.3, 4.0)) - 0.5)
+               + 0.012 * (noise(vec3(p.x * 3.0, p.y * 2.5, 9.0)) - 0.5);
+  float u = (p.x + wander) / BRAID_W;
+  float col = floor(u), lu = fract(u) - 0.5;
+  float side = lu < 0.0 ? 0.0 : 1.0, x = abs(lu) * 2.0;
+  // The strand pitch drifts along each braid as the braider's tension varies.
+  float drift = 0.4 * (noise(vec3(col * 3.7, p.y * 0.4, 2.0)) - 0.5);
+  float w = p.y / BRAID_STEP + drift + 0.5 * side + 0.35 * x + 0.3 * x * x + hash(vec3(col, 1.3, 7.1));
+  float seg = floor(w), a = fract(w) - 0.5;
+  // Segments vary in fullness, and loose fibres make every edge hairy.
+  float full = 0.8 + 0.35 * hash(vec3(col, seg, side + 2.0));
+  float fuzz = noise(vec3(p * 14.0, 6.0)) - 0.5;
+  x = clamp(x + 0.1 * fuzz, 0.0, 1.0);
+  a += 0.08 * fuzz;
+  // Padded lens: each strand narrows where it tucks under at both ends, and
+  // its flat-topped, soft-shouldered profile reads as a plump bundle of
+  // fibres rather than a hard ridge.
+  float s = sin(PI * x), aw = a / mix(0.7, 1.0, s);
+  float t = max(1.0 - 4.0 * aw * aw, 0.0);
+  float h = t * t * (3.0 - 2.0 * t) * pow(s, 0.4) * full;
+  id = vec3(col, seg, side);
+  sp = vec2(x, a);
+  // Twisted fibres in each strand: fine ridges along it.
+  float k = seg * 3.1 + side * 17.0 + col * 5.3;
+  return h * (0.88 + 0.08 * noise(vec3(x * 5.0, a * 14.0, k)) + 0.05 * noise(vec3(x * 16.0, a * 36.0, k)));
+}
+// Two octaves of noise, for blotchy organic shapes.
+float fbm(vec3 p) { return 0.65 * noise(p) + 0.35 * noise(p * 2.3 + 5.0); }
+// The detail fades to its average once strands shrink towards pixel size,
+// which keeps distant cloth from shimmering.
 vec3 cloth(out vec3 N, out float occl) {
-  vec2 q = v_world.xz / CLOTH_PITCH;
-  vec2 cell = floor(q), f = fract(q) - 0.5;
-  bool warpTop = mod(cell.x + cell.y, 2.0) < 0.5;
-  vec2 af = warpTop ? f.yx : f;                  // x: across the top thread, y: along it
-  float h = sqrt(max(1.0 - 4.0 * af.x * af.x, 0.0)) * (0.65 + 0.35 * cos(af.y * 2.0 * PI));
-  vec2 fw = fwidth(q);
-  float detail = 1.0 - smoothstep(0.3, 0.8, max(fw.x, fw.y));
-  vec2 tilt = vec2(af.x * 1.4, af.y * 0.6) * detail;   // slope -> normal tilt (across, along)
-  tilt = warpTop ? tilt.yx : tilt;                      // back to world (x, z)
-  N = normalize(vec3(tilt.x, 1.0, tilt.y));
-  occl = mix(0.8, mix(0.5, 1.0, h), detail);
-  // Thread-to-thread dye variation, fibre streaks along each thread, and broad mottling.
-  float thread = warpTop ? cell.y : cell.x;
-  float tone = hash(vec3(thread, warpTop ? 1.0 : 2.0, 3.7)) - 0.5;
-  vec3 fq = warpTop ? vec3(v_world.x * 6.0, v_world.z * 40.0, 1.0) : vec3(v_world.z * 6.0, v_world.x * 40.0, 5.0);
-  float fib = noise(fq);
-  float mott = noise(v_world * vec3(0.6, 0.0, 0.6) + 11.0);
-  return u_color * (1.0 + (0.12 * tone + 0.14 * (fib - 0.5)) * detail + 0.14 * (mott - 0.5));
+  vec2 p = v_world.xz;
+  vec3 id; vec2 sp, ign2; vec3 ign;
+  float h = braid(p, id, sp);
+  // A wide difference step blurs the slopes: the fuzz of loose fibres
+  // softens every edge of the relief.
+  const float E = 0.01;
+  vec2 g = vec2(braid(p + vec2(E, 0.0), ign, ign2) - braid(p - vec2(E, 0.0), ign, ign2),
+                braid(p + vec2(0.0, E), ign, ign2) - braid(p - vec2(0.0, E), ign, ign2)) / (2.0 * E);
+  vec2 fw = fwidth(p / BRAID_STEP);
+  float px = max(fw.x, fw.y);
+  float detail = 1.0 - smoothstep(0.25, 0.7, px);
+  float fine = 1.0 - smoothstep(0.06, 0.2, px);     // the hairs and specks go first
+  g *= BRAID_DEPTH * detail;
+  N = normalize(vec3(-g.x, 1.0, -g.y));
+  occl = mix(0.82, mix(0.6, 1.0, sqrt(h)), detail);
+  // Undyed jute: strands run from pale cream to tan, some braids a shade
+  // warmer than their neighbors, and fibres streak along each strand.
+  float tone = 0.1 + 0.55 * hash(vec3(id.x, id.y, id.z + 4.0)) + 0.35 * (hash(vec3(id.x, 9.2, 2.7)) - 0.5);
+  float fib = noise(vec3(sp.x * 4.0, sp.y * 9.0, id.y * 2.3 + id.z * 11.0 + id.x * 4.7));
+  float fib2 = noise(vec3(sp.x * 10.0, sp.y * 24.0, id.y * 1.7 + id.z * 5.0 + id.x * 3.1));
+  const vec3 PALE = vec3(1.06, 1.04, 1.01), TAN = vec3(0.98, 0.88, 0.74);
+  vec3 strand = mix(PALE, TAN, clamp(tone + 0.3 * (fib - 0.5), 0.0, 1.0)) * (1.0 + 0.12 * (fib2 - 0.5));
+  // The odd darker fibre spun into a strand.
+  float speck = noise(vec3(p * 12.0, 8.0));
+  strand *= 1.0 - 0.22 * fine * smoothstep(0.78, 0.9, speck);
+  vec3 c = mix(mix(PALE, TAN, 0.5), strand, detail);
+  // Weathering: broad yellowed patches, and old water stains that dried
+  // with a darker tide line around their edge.
+  float age = fbm(vec3(p.x * 0.15, 11.0, p.y * 0.15));
+  c *= mix(vec3(1.0), vec3(1.0, 0.95, 0.87), age);
+  float st = fbm(vec3(p.x * 0.4, 3.0, p.y * 0.4));
+  float stain = smoothstep(0.56, 0.85, st), rim = smoothstep(0.53, 0.6, st) - smoothstep(0.6, 0.72, st);
+  c *= mix(vec3(1.0), vec3(0.78, 0.66, 0.5), 0.1 * stain + 0.2 * rim);
+  return u_color * c;
 }
 
 vec3 ambient(vec3 N) { return mix(vec3(0.36, 0.33, 0.31), vec3(0.54, 0.55, 0.58), N.y * 0.5 + 0.5); }
