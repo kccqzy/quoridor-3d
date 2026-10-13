@@ -272,18 +272,36 @@ function analyse(s) {
  * Hint search: negamax with alpha-beta and iterative deepening under a
  * hard time budget. Fence candidates are limited to slots that cut the
  * opponent's current shortest path, which keeps the branching factor small.
+ * A transposition table (Zobrist hashing) caches results across move
+ * orders and across calls, and supplies the best move to try first.
  * ===================================================================== */
+// Zobrist keys as two 32-bit halves: the low half picks the table slot,
+// the high half is stored to verify it.
+const zRand = (() => { let x = 0x9E3779B9; return () => { x ^= x << 13; x ^= x >>> 17; x ^= x << 5; return x | 0; }; })();
+const zKeys = n => { const a = new Int32Array(n * 2); for (let k = 0; k < a.length; k++) a[k] = zRand(); return a; };
+const Z_PAWN = [zKeys(81), zKeys(81)], Z_H = zKeys(64), Z_V = zKeys(64), Z_LEFT = [zKeys(11), zKeys(11)], Z_SIDE = zKeys(1);
+const TT_SIZE = 1 << 20, TT_MASK = TT_SIZE - 1;
+const ttKey = new Int32Array(TT_SIZE), ttVal = new Int32Array(TT_SIZE), ttMove = new Int16Array(TT_SIZE);
+const ttDepth = new Int8Array(TT_SIZE).fill(-1), ttFlag = new Uint8Array(TT_SIZE);
+const TT_EXACT = 0, TT_LOWER = 1, TT_UPPER = 2;
+
 function suggestMove(src, budgetMs) {
   const s = cloneState(src);
   const me = s.turn;
   const deadline = performance.now() + budgetMs;
   const TIMEOUT = {};
-  const WIN = 100000, RACE = 5000;
+  const WIN = 100000, WIN_BAND = WIN - 1000, RACE = 5000;
   const TEMPO = 5, FENCE = 12;
   let nodes = 0;
 
-  // Score for p, who is to move: path race (10 per step), half a step for
-  // having the move, and fences in hand.
+  // Incremental hash of the position (side to move is added when probing).
+  let hLo = 0, hHi = 0;
+  const zx = (tab, k) => { hLo ^= tab[2 * k]; hHi ^= tab[2 * k + 1]; };
+  for (let p = 0; p < 2; p++) { zx(Z_PAWN[p], s.pr[p] * 9 + s.pc[p]); zx(Z_LEFT[p], s.left[p]); }
+  for (let k = 0; k < 64; k++) { if (s.h[k]) zx(Z_H, k); if (s.v[k]) zx(Z_V, k); }
+
+  // Score for p, who will move: path difference, half a step for moving next,
+  // and fences in hand.
   function evaluate(p) {
     const dMe = dist(s, p), dOp = dist(s, 1 - p);
     // Handle player without fences.
@@ -292,47 +310,76 @@ function suggestMove(src, budgetMs) {
     return (dOp - dMe) * 10 + TEMPO + FENCE * (s.left[p] - s.left[1 - p]);
   }
 
+
   function gen(p) {
     const out = [];
-    for (const [r, c] of pawnMoves(s, p)) out.push({ t: 0, r, c });
+    for (const [r, c] of pawnMoves(s, p)) out.push({ t: 0, r, c, code: r * 9 + c });
     if (s.left[p] > 0) {
       const seen = new Uint8Array(128);
       for (const [r, c, d] of pathSteps(s, 1 - p)) for (const [o, i, j] of blockers(r, c, d)) {
         const key = o * 64 + i * 8 + j;
         if (seen[key]) continue;
         seen[key] = 1;
-        if (fenceFree(s, o, i, j)) out.push({ t: 1, o, i, j });
+        if (fenceFree(s, o, i, j)) out.push({ t: 1, o, i, j, code: 128 + key });
       }
     }
     return out;
   }
+
   // Applies m for player p; returns an undo function, or null if illegal.
   function play(m, p) {
     if (m.t === 0) {
-      const r = s.pr[p], c = s.pc[p];
+      const r = s.pr[p], c = s.pc[p], from = r * 9 + c, to = m.r * 9 + m.c;
+      zx(Z_PAWN[p], from); zx(Z_PAWN[p], to);
       s.pr[p] = m.r; s.pc[p] = m.c;
-      return () => { s.pr[p] = r; s.pc[p] = c; };
+      return () => { zx(Z_PAWN[p], to); zx(Z_PAWN[p], from); s.pr[p] = r; s.pc[p] = c; };
     }
-    const arr = m.o ? s.v : s.h, k = m.i * 8 + m.j;
+    const arr = m.o ? s.v : s.h, k = m.i * 8 + m.j, zf = m.o ? Z_V : Z_H;
     arr[k] = 1; s.left[p]--;
     if (dist(s, 0) >= UNREACH || dist(s, 1) >= UNREACH) { arr[k] = 0; s.left[p]++; return null; }
-    return () => { arr[k] = 0; s.left[p]++; };
+    zx(zf, k); zx(Z_LEFT[p], s.left[p] + 1); zx(Z_LEFT[p], s.left[p]);
+    return () => { zx(zf, k); zx(Z_LEFT[p], s.left[p]); zx(Z_LEFT[p], s.left[p] + 1); arr[k] = 0; s.left[p]++; };
   }
+
+  // Win scores are stored relative to the node, not the root.
+  const toTT = (v, ply) => v >= WIN_BAND ? v + ply : v <= -WIN_BAND ? v - ply : v;
+  const fromTT = (v, ply) => v >= WIN_BAND ? v - ply : v <= -WIN_BAND ? v + ply : v;
+
   function search(depth, alpha, beta, p, ply) {
     if ((++nodes & 63) === 0 && performance.now() > deadline) throw TIMEOUT;
     if (s.pr[1 - p] === GOAL[1 - p]) return -(WIN - ply);   // previous mover won
     if (depth === 0) return evaluate(p);
-    let best = -Infinity;
-    for (const m of gen(p)) {
+
+    const lo = p ? hLo ^ Z_SIDE[0] : hLo, hi = p ? hHi ^ Z_SIDE[1] : hHi, idx = lo & TT_MASK;
+    let hashMove = -1;
+    if (ttKey[idx] === hi && ttDepth[idx] >= 0) {
+      hashMove = ttMove[idx];
+      if (ttDepth[idx] >= depth) {
+        const v = fromTT(ttVal[idx], ply), f = ttFlag[idx];
+        if (f === TT_EXACT || (f === TT_LOWER && v >= beta) || (f === TT_UPPER && v <= alpha)) return v;
+      }
+    }
+
+    const moves = gen(p);
+    if (hashMove >= 0) {
+      const at = moves.findIndex(m => m.code === hashMove);
+      if (at > 0) moves.unshift(moves.splice(at, 1)[0]);
+    }
+    const alpha0 = alpha;
+    let best = -Infinity, bestCode = -1;
+    for (const m of moves) {
       const undo = play(m, p);
       if (!undo) continue;
       const v = -search(depth - 1, -beta, -alpha, 1 - p, ply + 1);
       undo();
-      if (v > best) best = v;
+      if (v > best) { best = v; bestCode = m.code; }
       if (v > alpha) alpha = v;
       if (alpha >= beta) break;
     }
-    return best === -Infinity ? evaluate(p) : best;
+    if (best === -Infinity) return evaluate(p);
+    ttKey[idx] = hi; ttVal[idx] = toTT(best, ply); ttDepth[idx] = depth; ttMove[idx] = bestCode;
+    ttFlag[idx] = best <= alpha0 ? TT_UPPER : best >= beta ? TT_LOWER : TT_EXACT;
+    return best;
   }
 
   // Root: pawn moves first, ordered by resulting distance (good for pruning
@@ -342,7 +389,7 @@ function suggestMove(src, budgetMs) {
   rootMoves.sort((a, b) => key(a) - key(b));
 
   let bestMove = rootMoves[0] || null;
-  for (let depth = 1; depth <= 10; depth++) {
+  for (let depth = 1; depth <= 30; depth++) {
     try {
       let alpha = -Infinity, curBest = null;
       for (const m of rootMoves) {
@@ -355,7 +402,10 @@ function suggestMove(src, budgetMs) {
       if (!curBest) break;
       bestMove = curBest;
       rootMoves = [curBest, ...rootMoves.filter(m => m !== curBest)];
-      if (alpha >= WIN - 100) break;   // forced win found
+      // Forced win found. Only stop once it is short enough to be fully seen at
+      // this depth: a win score taken from the table may be a slower win than
+      // one the next iteration would find, and chasing it can loop forever.
+      if (alpha >= WIN - 100 && WIN - alpha <= depth) break;
     } catch (e) {
       if (e !== TIMEOUT) throw e;
       break;   // keep the result of the last fully searched depth
